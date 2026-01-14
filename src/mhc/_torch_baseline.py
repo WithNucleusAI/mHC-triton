@@ -228,9 +228,10 @@ class HyperConnectionTorch(nn.Module):
                 self.phi = nn.Parameter(torch.zeros(in_dim, out_dim))
                 
                 # Learnable scales (alpha_pre, alpha_post, alpha_res)
-                self.alpha_pre = nn.Parameter(torch.tensor(init_scale))
-                self.alpha_post = nn.Parameter(torch.tensor(init_scale))
-                self.alpha_res = nn.Parameter(torch.tensor(init_scale))
+                # NOTE: keep these as 1D tensors with numel==1 for FSDP/fully_shard compatibility
+                self.alpha_pre = nn.Parameter(torch.tensor([init_scale]))
+                self.alpha_post = nn.Parameter(torch.tensor([init_scale]))
+                self.alpha_res = nn.Parameter(torch.tensor([init_scale]))
             else:
                 # Original: separate projection matrices
                 self.W_post = nn.Linear(in_dim, n, bias=False)
@@ -242,9 +243,10 @@ class HyperConnectionTorch(nn.Module):
                 nn.init.zeros_(self.W_pre.weight)
                 nn.init.zeros_(self.W_res.weight)
 
-                self.scale_post = nn.Parameter(torch.tensor(init_scale))
-                self.scale_pre = nn.Parameter(torch.tensor(init_scale))
-                self.scale_res = nn.Parameter(torch.tensor(init_scale))
+                # NOTE: keep these as 1D tensors with numel==1 for FSDP/fully_shard compatibility
+                self.scale_post = nn.Parameter(torch.tensor([init_scale]))
+                self.scale_pre = nn.Parameter(torch.tensor([init_scale]))
+                self.scale_res = nn.Parameter(torch.tensor([init_scale]))
 
     def _compute_weights(self, H: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute constrained connection weights from input."""

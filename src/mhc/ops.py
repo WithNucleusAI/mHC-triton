@@ -119,6 +119,9 @@ class _FusedDynamicWeights(torch.autograd.Function):
         x_dtype = x.dtype
         phi_dtype = phi.dtype
         bias_dtype = bias.dtype
+        alpha_pre_dtype = alpha_pre.dtype
+        alpha_post_dtype = alpha_post.dtype
+        alpha_res_dtype = alpha_res.dtype
         
         # Convert everything to float32 for computation
         x = x.float()
@@ -217,9 +220,9 @@ class _FusedDynamicWeights(torch.autograd.Function):
             grad_x.to(x_dtype),
             grad_phi.to(phi_dtype),
             grad_bias.to(bias_dtype),
-            grad_alpha_pre.reshape(()).to(alpha_pre.dtype),
-            grad_alpha_post.reshape(()).to(alpha_post.dtype),
-            grad_alpha_res.reshape(()).to(alpha_res.dtype),
+            grad_alpha_pre.reshape_as(alpha_pre).to(alpha_pre_dtype),
+            grad_alpha_post.reshape_as(alpha_post).to(alpha_post_dtype),
+            grad_alpha_res.reshape_as(alpha_res).to(alpha_res_dtype),
             None,  # sinkhorn_iters
             None,  # eps
         )

@@ -54,6 +54,7 @@ class HyperConnection(nn.Module):
         self.num_streams = num_streams
         self.dynamic = dynamic
         self.sinkhorn_iters = sinkhorn_iters
+        self.init_scale = init_scale
         self.layer_idx = layer_idx
         self.eps = eps
         self.use_fused_weights = use_fused_weights and dynamic
@@ -79,9 +80,10 @@ class HyperConnection(nn.Module):
                 self.phi = nn.Parameter(torch.zeros(in_dim, out_dim))
                 
                 # Learnable scales (alpha_pre, alpha_post, alpha_res)
-                self.alpha_pre = nn.Parameter(torch.tensor(init_scale))
-                self.alpha_post = nn.Parameter(torch.tensor(init_scale))
-                self.alpha_res = nn.Parameter(torch.tensor(init_scale))
+                # NOTE: keep these as 1D tensors with numel==1 for FSDP/fully_shard compatibility
+                self.alpha_pre = nn.Parameter(torch.tensor([init_scale]))
+                self.alpha_post = nn.Parameter(torch.tensor([init_scale]))
+                self.alpha_res = nn.Parameter(torch.tensor([init_scale]))
             else:
                 # Original: separate projection matrices
                 self.W_post = nn.Linear(in_dim, n, bias=False)
@@ -93,9 +95,10 @@ class HyperConnection(nn.Module):
                 nn.init.zeros_(self.W_pre.weight)
                 nn.init.zeros_(self.W_res.weight)
 
-                self.scale_post = nn.Parameter(torch.tensor(init_scale))
-                self.scale_pre = nn.Parameter(torch.tensor(init_scale))
-                self.scale_res = nn.Parameter(torch.tensor(init_scale))
+                # NOTE: keep these as 1D tensors with numel==1 for FSDP/fully_shard compatibility
+                self.scale_post = nn.Parameter(torch.tensor([init_scale]))
+                self.scale_pre = nn.Parameter(torch.tensor([init_scale]))
+                self.scale_res = nn.Parameter(torch.tensor([init_scale]))
 
     def _compute_weights(self, H: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute constrained connection weights from input."""
@@ -185,3 +188,37 @@ class HyperConnection(nn.Module):
             f"use_fused_weights={self.use_fused_weights}"
         )
 
+    def init_weights(self, layer_idx=None):
+        """
+        Reinitialize weights, optionally updating the layer index.
+        
+        Args:
+            layer_idx: If provided, updates the layer index used for H_pre_base initialization
+        """
+        n = self.num_streams
+        
+        # Update layer_idx if provided
+        if layer_idx is not None:
+            self.layer_idx = layer_idx
+        
+        # Initialize base parameters
+        nn.init.ones_(self.H_post_base)
+        
+        nn.init.zeros_(self.H_pre_base)
+        self.H_pre_base.data[self.layer_idx % n] = 1.0
+        
+        nn.init.eye_(self.H_res_base)
+        
+        # Initialize dynamic weight parameters
+        if self.dynamic:
+            if self.use_fused_weights:
+                nn.init.zeros_(self.phi)
+
+                # Initialize scales
+                nn.init.constant_(self.alpha_pre, self.init_scale)
+                nn.init.constant_(self.alpha_post, self.init_scale)
+                nn.init.constant_(self.alpha_res, self.init_scale)
+            else:
+                nn.init.zeros_(self.W_post.weight)
+                nn.init.zeros_(self.W_pre.weight)
+                nn.init.zeros_(self.W_res.weight)
