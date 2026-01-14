@@ -16,9 +16,12 @@ from mhc import (
     sinkhorn_knopp,
     fused_stream_mix,
     fused_add_residual,
+    fused_dynamic_weights,
+    fused_dynamic_weights_v2,
     sinkhorn_knopp_torch,
     fused_stream_mix_torch,
     fused_add_residual_torch,
+    fused_dynamic_weights_torch,
     HyperConnection,
     HyperConnectionTorch,
 )
@@ -102,6 +105,51 @@ def benchmark_add_residual(
     )
 
     return torch_time, triton_time
+
+
+def benchmark_dynamic_weights(
+    batch: int, dim: int, device: str = "cuda"
+) -> Tuple[float, float, float]:
+    """Benchmark dynamic weight computation (Eq. 14-19).
+    
+    Returns: (torch_time, triton_v1_time, triton_v2_time)
+    """
+    n = 4
+    in_dim = n * dim  # nC
+    out_dim = n * n + 2 * n  # 24
+    
+    x = torch.randn(batch, in_dim, device=device, dtype=torch.float32)
+    phi = torch.randn(in_dim, out_dim, device=device, dtype=torch.float32) * 0.01
+    bias = torch.randn(out_dim, device=device, dtype=torch.float32)
+    alpha_pre = torch.tensor(0.1, device=device, dtype=torch.float32)
+    alpha_post = torch.tensor(0.1, device=device, dtype=torch.float32)
+    alpha_res = torch.tensor(0.1, device=device, dtype=torch.float32)
+    
+    # PyTorch baseline
+    torch_time = benchmark_fn(
+        lambda: fused_dynamic_weights_torch(
+            x, phi, bias, alpha_pre, alpha_post, alpha_res
+        ),
+        (),
+    )
+    
+    # Triton V1 (separate Sinkhorn kernel)
+    triton_v1_time = benchmark_fn(
+        lambda: fused_dynamic_weights(
+            x, phi, bias, alpha_pre, alpha_post, alpha_res
+        ),
+        (),
+    )
+    
+    # Triton V2 (fully fused)
+    triton_v2_time = benchmark_fn(
+        lambda: fused_dynamic_weights_v2(
+            x, phi, bias, alpha_pre, alpha_post, alpha_res
+        ),
+        (),
+    )
+    
+    return torch_time, triton_v1_time, triton_v2_time
 
 
 def benchmark_full_forward_backward(
@@ -303,6 +351,16 @@ def main():
     speedup = torch_time / triton_time
     results.append(("Add Residual", torch_time, triton_time, speedup))
     print(f"Add Residual:            PyTorch {torch_time:.2f}ms | Triton {triton_time:.2f}ms | Speedup {speedup:.1f}x")
+
+    # Dynamic Weights benchmark (Eq. 14-19)
+    torch_time, triton_v1_time, triton_v2_time = benchmark_dynamic_weights(args.batch, args.dim)
+    speedup_v1 = torch_time / triton_v1_time
+    speedup_v2 = torch_time / triton_v2_time
+    v2_vs_v1 = triton_v1_time / triton_v2_time
+    print(f"Dynamic Weights (Eq14-19):")
+    print(f"  PyTorch:               {torch_time:.4f}ms")
+    print(f"  Triton V1:             {triton_v1_time:.4f}ms (Speedup {speedup_v1:.1f}x vs PyTorch)")
+    print(f"  Triton V2 (fused):     {triton_v2_time:.4f}ms (Speedup {speedup_v2:.1f}x vs PyTorch, {v2_vs_v1:.2f}x vs V1)")
 
     # Full Forward+Backward benchmark
     torch_time, triton_time = benchmark_full_forward_backward(args.batch, args.seq, args.dim)

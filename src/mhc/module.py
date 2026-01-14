@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Callable
 
-from .ops import sinkhorn_knopp, fused_stream_mix, fused_add_residual
+from .ops import sinkhorn_knopp, fused_stream_mix, fused_add_residual, fused_dynamic_weights_v2
 
 
 class HyperConnection(nn.Module):
@@ -24,6 +24,7 @@ class HyperConnection(nn.Module):
         dynamic: If True, compute input-dependent weights
         sinkhorn_iters: Iterations for doubly stochastic projection
         init_scale: Initial scale for dynamic weight deltas
+        use_fused_weights: If True, use fused kernel for dynamic weights (Eq. 14-19)
 
     Example:
         >>> hc = HyperConnection(dim=512, num_streams=4).cuda()
@@ -41,6 +42,8 @@ class HyperConnection(nn.Module):
         dynamic: bool = True,
         sinkhorn_iters: int = 20,
         init_scale: float = 0.1,
+        eps: float = 1e-6,
+        use_fused_weights: bool = True,
     ):
         super().__init__()
 
@@ -52,10 +55,14 @@ class HyperConnection(nn.Module):
         self.dynamic = dynamic
         self.sinkhorn_iters = sinkhorn_iters
         self.layer_idx = layer_idx
+        self.eps = eps
+        self.use_fused_weights = use_fused_weights and dynamic
 
         n = num_streams
+        in_dim = n * dim  # nC
+        out_dim = n * n + 2 * n  # n^2 + 2n = 24 for n=4
 
-        # Base parameters
+        # Base parameters (used as bias in fused kernel)
         self.H_post_base = nn.Parameter(torch.ones(n))
 
         H_pre_init = torch.zeros(n)
@@ -66,19 +73,29 @@ class HyperConnection(nn.Module):
 
         # Dynamic weight predictors
         if dynamic:
-            self.norm = nn.LayerNorm(dim)
-            self.W_post = nn.Linear(n * dim, n, bias=False)
-            self.W_pre = nn.Linear(n * dim, n, bias=False)
-            self.W_res = nn.Linear(n * dim, n * n, bias=False)
+            if use_fused_weights:
+                # Fused: single combined projection matrix phi [in_dim, out_dim]
+                # Layout: [H_pre (n), H_post (n), H_res (n*n)]
+                self.phi = nn.Parameter(torch.zeros(in_dim, out_dim))
+                
+                # Learnable scales (alpha_pre, alpha_post, alpha_res)
+                self.alpha_pre = nn.Parameter(torch.tensor(init_scale))
+                self.alpha_post = nn.Parameter(torch.tensor(init_scale))
+                self.alpha_res = nn.Parameter(torch.tensor(init_scale))
+            else:
+                # Original: separate projection matrices
+                self.W_post = nn.Linear(in_dim, n, bias=False)
+                self.W_pre = nn.Linear(in_dim, n, bias=False)
+                self.W_res = nn.Linear(in_dim, n * n, bias=False)
 
-            # Zero init for residual-like behavior at start
-            nn.init.zeros_(self.W_post.weight)
-            nn.init.zeros_(self.W_pre.weight)
-            nn.init.zeros_(self.W_res.weight)
+                # Zero init for residual-like behavior at start
+                nn.init.zeros_(self.W_post.weight)
+                nn.init.zeros_(self.W_pre.weight)
+                nn.init.zeros_(self.W_res.weight)
 
-            self.scale_post = nn.Parameter(torch.tensor(init_scale))
-            self.scale_pre = nn.Parameter(torch.tensor(init_scale))
-            self.scale_res = nn.Parameter(torch.tensor(init_scale))
+                self.scale_post = nn.Parameter(torch.tensor(init_scale))
+                self.scale_pre = nn.Parameter(torch.tensor(init_scale))
+                self.scale_res = nn.Parameter(torch.tensor(init_scale))
 
     def _compute_weights(self, H: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute constrained connection weights from input."""
@@ -96,9 +113,34 @@ class HyperConnection(nn.Module):
             )
             return H_post.contiguous(), H_pre.contiguous(), H_res.contiguous()
 
-        # Dynamic weights based on input
-        H_norm = self.norm(H)
-        H_flat = H_norm.reshape(batch, -1, n * self.dim).mean(dim=1)
+        if self.use_fused_weights:
+            # Fused kernel path V2 (Eq. 14-19 from paper)
+            # Optimizations: transposed phi, fully fused Sinkhorn, coalesced access
+            # Mean pool across sequence: [batch, seq, n, dim] -> [batch, n*dim]
+            x = H.mean(dim=1).reshape(batch, n * self.dim)
+            
+            # Build combined bias from base parameters
+            # Layout: [H_pre_base (n), H_post_base (n), H_res_base (n*n)]
+            bias = torch.cat([
+                self.H_pre_base,
+                self.H_post_base,
+                self.H_res_base.flatten(),
+            ])
+            
+            H_pre, H_post, H_res = fused_dynamic_weights_v2(
+                x, self.phi, bias,
+                self.alpha_pre, self.alpha_post, self.alpha_res,
+                self.sinkhorn_iters, self.eps,
+            )
+            
+            return H_post.contiguous(), H_pre.contiguous(), H_res.contiguous()
+
+        # Original path: separate projections
+        # Mean pool with RMSNorm (separate norm layer)
+        H_flat = H.mean(dim=1).reshape(batch, n * self.dim)
+        # Apply RMSNorm manually since we don't have the norm layer in this path
+        rms = torch.sqrt((H_flat * H_flat).mean(dim=-1, keepdim=True) + self.eps)
+        H_flat = H_flat / rms
 
         delta_post = self.W_post(H_flat) * self.scale_post
         delta_pre = self.W_pre(H_flat) * self.scale_pre
@@ -139,6 +181,7 @@ class HyperConnection(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"dim={self.dim}, num_streams={self.num_streams}, "
-            f"dynamic={self.dynamic}, sinkhorn_iters={self.sinkhorn_iters}"
+            f"dynamic={self.dynamic}, sinkhorn_iters={self.sinkhorn_iters}, "
+            f"use_fused_weights={self.use_fused_weights}"
         )
 
