@@ -82,7 +82,7 @@ This implementation incorporates the efficiency techniques from Section 4.3 of t
   <img src="optimizations.png" alt="Optimizations from the mHC paper" width="60%">
 </p>
 
-Instead of separate operations for projection, normalization, and activation, we fuse everything into a single kernel:
+Instead of separate operations for projection, normalization, and activation, fuse everything into a single kernel:
 
 ```
 x ──► φ·x ──► RMSNorm ──► Scale+Bias ──► Activations ──► Sinkhorn ──► H_pre, H_post, H_res
@@ -110,7 +110,7 @@ This avoids shared memory entirely and enables efficient in-register Sinkhorn it
 
 ### 3. Sinkhorn Backward with O(T²) Recomputation
 
-The forward Sinkhorn pass has T iterations, each producing an intermediate matrix. Storing all T matrices would require O(T) memory. Instead, we use **recomputation**:
+The forward Sinkhorn pass has T iterations, each producing an intermediate matrix. Storing all T matrices would require O(T) memory. Instead, use **recomputation**:
 
 ```
 Memory: O(1) instead of O(T)
@@ -121,7 +121,7 @@ For T=20 iterations, this trades 20× more compute for 20× less memory—a good
 
 ### 4. Optimized Weight Gradient Reduction
 
-Weight gradients (dH_pre, dH_post, dH_res) require summing over sequence and dimension axes. We use a two-phase approach:
+Weight gradients (dH_pre, dH_post, dH_res) require summing over sequence and dimension axes. Use a two-phase approach:
 
 1. **Triton kernel**: Computes partial sums per (batch, seq, dim_block) tile
 2. **PyTorch reduction**: Uses optimized `tensor.sum()` for final reduction
