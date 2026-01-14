@@ -109,17 +109,26 @@ Benchmarks on NVIDIA H100 80GB HBM3 (batch=16, seq=2048, dim=4096):
 
 | Operation | PyTorch | Triton | Speedup |
 |-----------|---------|--------|---------|
-| Sinkhorn (20 iter) | 0.73ms | 0.47ms | 1.6x |
-| Stream Mix | 8.54ms | 1.00ms | 8.6x |
+| Sinkhorn (20 iter) | 0.74ms | 0.47ms | 1.6x |
+| Stream Mix | 8.53ms | 1.00ms | 8.6x |
 | Add Residual | 2.57ms | 0.89ms | 2.9x |
-| Full Forward+Backward | 88.48ms | 60.43ms | 1.5x |
+| Dynamic Weights | 0.90ms | 0.11ms | 7.9x |
+| Full Forward+Backward | 85.00ms | 13.66ms | 6.2x |
 
 ### Memory
 
 | Operation | PyTorch | Triton | Savings |
 |-----------|---------|--------|---------|
 | Sinkhorn Backward | 120.0MB | 68.0MB | 1.8x |
-| Full Forward+Backward | 8004.6MB | 6723.3MB | 1.2x |
+| Full Forward+Backward | 8003.6MB | 6162.8MB | 1.3x |
+
+### vs Simple Residual
+
+| Method | Time | Memory |
+|--------|------|--------|
+| Simple Residual | 4.01ms | 5184.0MB |
+| HyperConnection (Triton) | 13.66ms | 6162.8MB |
+| **Overhead** | **3.4x** | **1.2x** |
 
 ## Requirements
 
