@@ -1,9 +1,11 @@
 """Forward Triton kernels for Manifold-Constrained Hyper-Connections.
 
-Optimizations:
+Optimizations from DeepSeek mHC paper Section 4.3:
 - Fused operations to minimize kernel launches
+- Transposed phi layout for coalesced memory access
+- Inline Sinkhorn-Knopp (no separate kernel)
 - 4x4 matrices kept in registers
-- FP16 compute with FP32 accumulation
+- Mixed-precision: BF16 input → FP32 compute → FP32 output
 """
 
 import torch
@@ -172,215 +174,6 @@ def _stream_mix_kernel(
 
 
 # -----------------------------------------------------------------------------
-# Fused Dynamic Weight Kernels (Eq. 14-19 from paper)
-# Computes projection, norm, scaling, and activations in minimal passes
-# -----------------------------------------------------------------------------
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_K': 256}, num_warps=4),
-        triton.Config({'BLOCK_K': 512}, num_warps=4),
-        triton.Config({'BLOCK_K': 1024}, num_warps=8),
-        triton.Config({'BLOCK_K': 2048}, num_warps=8),
-    ],
-    key=['in_dim'],
-)
-@triton.jit
-def _fused_dynamic_weights_kernel(
-    # Inputs
-    x_ptr,          # [batch, in_dim] - flattened hyper-hidden (mean pooled)
-    phi_ptr,        # [in_dim, out_dim] - combined projection matrix  
-    bias_ptr,       # [out_dim] - combined bias (absorbs base params)
-    alpha_pre,      # scalar
-    alpha_post,     # scalar
-    alpha_res,      # scalar
-    # Outputs
-    H_pre_ptr,      # [batch, n] - pre weights (normalized)
-    H_post_ptr,     # [batch, n] - post weights (2*sigmoid)
-    H_res_ptr,      # [batch, n, n] - residual matrix (before Sinkhorn)
-    # Dimensions
-    batch,
-    in_dim,         # nC (e.g., 16384)
-    # Block sizes
-    BLOCK_K: tl.constexpr,
-    eps: tl.constexpr,
-):
-    """
-    Fused kernel implementing Eq. 14-18 from the paper.
-    
-    One program per batch element. Computes:
-    1. x @ phi (matmul: [1, in_dim] @ [in_dim, 24] -> [1, 24])
-    2. ||x||_2 / sqrt(in_dim) (RMS norm)
-    3. Scale + bias + activations
-    
-    Uses 24 scalar accumulators (fits in registers) and streams through x once.
-    """
-    pid = tl.program_id(0)
-    if pid >= batch:
-        return
-    
-    # Constants
-    OUT_DIM: tl.constexpr = 24  # n^2 + 2n for n=4
-    
-    # Initialize 24 accumulators and norm accumulator
-    acc0 = 0.0; acc1 = 0.0; acc2 = 0.0; acc3 = 0.0
-    acc4 = 0.0; acc5 = 0.0; acc6 = 0.0; acc7 = 0.0
-    acc8 = 0.0; acc9 = 0.0; acc10 = 0.0; acc11 = 0.0
-    acc12 = 0.0; acc13 = 0.0; acc14 = 0.0; acc15 = 0.0
-    acc16 = 0.0; acc17 = 0.0; acc18 = 0.0; acc19 = 0.0
-    acc20 = 0.0; acc21 = 0.0; acc22 = 0.0; acc23 = 0.0
-    norm_sq = 0.0
-    
-    # Stream through input dimension
-    x_base = x_ptr + pid * in_dim
-    
-    for k_start in range(0, in_dim, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offs < in_dim
-        
-        # Load x block
-        x_vals = tl.load(x_base + k_offs, mask=k_mask, other=0.0).to(tl.float32)
-        
-        # Accumulate squared norm
-        norm_sq += tl.sum(x_vals * x_vals)
-        
-        # Load phi rows and compute dot products
-        # phi is [in_dim, 24], row-major
-        phi_base = phi_ptr + k_offs * OUT_DIM
-        
-        phi0 = tl.load(phi_base + 0, mask=k_mask, other=0.0).to(tl.float32)
-        phi1 = tl.load(phi_base + 1, mask=k_mask, other=0.0).to(tl.float32)
-        phi2 = tl.load(phi_base + 2, mask=k_mask, other=0.0).to(tl.float32)
-        phi3 = tl.load(phi_base + 3, mask=k_mask, other=0.0).to(tl.float32)
-        phi4 = tl.load(phi_base + 4, mask=k_mask, other=0.0).to(tl.float32)
-        phi5 = tl.load(phi_base + 5, mask=k_mask, other=0.0).to(tl.float32)
-        phi6 = tl.load(phi_base + 6, mask=k_mask, other=0.0).to(tl.float32)
-        phi7 = tl.load(phi_base + 7, mask=k_mask, other=0.0).to(tl.float32)
-        phi8 = tl.load(phi_base + 8, mask=k_mask, other=0.0).to(tl.float32)
-        phi9 = tl.load(phi_base + 9, mask=k_mask, other=0.0).to(tl.float32)
-        phi10 = tl.load(phi_base + 10, mask=k_mask, other=0.0).to(tl.float32)
-        phi11 = tl.load(phi_base + 11, mask=k_mask, other=0.0).to(tl.float32)
-        phi12 = tl.load(phi_base + 12, mask=k_mask, other=0.0).to(tl.float32)
-        phi13 = tl.load(phi_base + 13, mask=k_mask, other=0.0).to(tl.float32)
-        phi14 = tl.load(phi_base + 14, mask=k_mask, other=0.0).to(tl.float32)
-        phi15 = tl.load(phi_base + 15, mask=k_mask, other=0.0).to(tl.float32)
-        phi16 = tl.load(phi_base + 16, mask=k_mask, other=0.0).to(tl.float32)
-        phi17 = tl.load(phi_base + 17, mask=k_mask, other=0.0).to(tl.float32)
-        phi18 = tl.load(phi_base + 18, mask=k_mask, other=0.0).to(tl.float32)
-        phi19 = tl.load(phi_base + 19, mask=k_mask, other=0.0).to(tl.float32)
-        phi20 = tl.load(phi_base + 20, mask=k_mask, other=0.0).to(tl.float32)
-        phi21 = tl.load(phi_base + 21, mask=k_mask, other=0.0).to(tl.float32)
-        phi22 = tl.load(phi_base + 22, mask=k_mask, other=0.0).to(tl.float32)
-        phi23 = tl.load(phi_base + 23, mask=k_mask, other=0.0).to(tl.float32)
-        
-        # Accumulate dot products
-        acc0 += tl.sum(x_vals * phi0)
-        acc1 += tl.sum(x_vals * phi1)
-        acc2 += tl.sum(x_vals * phi2)
-        acc3 += tl.sum(x_vals * phi3)
-        acc4 += tl.sum(x_vals * phi4)
-        acc5 += tl.sum(x_vals * phi5)
-        acc6 += tl.sum(x_vals * phi6)
-        acc7 += tl.sum(x_vals * phi7)
-        acc8 += tl.sum(x_vals * phi8)
-        acc9 += tl.sum(x_vals * phi9)
-        acc10 += tl.sum(x_vals * phi10)
-        acc11 += tl.sum(x_vals * phi11)
-        acc12 += tl.sum(x_vals * phi12)
-        acc13 += tl.sum(x_vals * phi13)
-        acc14 += tl.sum(x_vals * phi14)
-        acc15 += tl.sum(x_vals * phi15)
-        acc16 += tl.sum(x_vals * phi16)
-        acc17 += tl.sum(x_vals * phi17)
-        acc18 += tl.sum(x_vals * phi18)
-        acc19 += tl.sum(x_vals * phi19)
-        acc20 += tl.sum(x_vals * phi20)
-        acc21 += tl.sum(x_vals * phi21)
-        acc22 += tl.sum(x_vals * phi22)
-        acc23 += tl.sum(x_vals * phi23)
-    
-    # Compute RMS factor
-    inv_rms = 1.0 / tl.sqrt(norm_sq / in_dim + eps)
-    
-    # Load biases
-    b0 = tl.load(bias_ptr + 0); b1 = tl.load(bias_ptr + 1)
-    b2 = tl.load(bias_ptr + 2); b3 = tl.load(bias_ptr + 3)
-    b4 = tl.load(bias_ptr + 4); b5 = tl.load(bias_ptr + 5)
-    b6 = tl.load(bias_ptr + 6); b7 = tl.load(bias_ptr + 7)
-    b8 = tl.load(bias_ptr + 8); b9 = tl.load(bias_ptr + 9)
-    b10 = tl.load(bias_ptr + 10); b11 = tl.load(bias_ptr + 11)
-    b12 = tl.load(bias_ptr + 12); b13 = tl.load(bias_ptr + 13)
-    b14 = tl.load(bias_ptr + 14); b15 = tl.load(bias_ptr + 15)
-    b16 = tl.load(bias_ptr + 16); b17 = tl.load(bias_ptr + 17)
-    b18 = tl.load(bias_ptr + 18); b19 = tl.load(bias_ptr + 19)
-    b20 = tl.load(bias_ptr + 20); b21 = tl.load(bias_ptr + 21)
-    b22 = tl.load(bias_ptr + 22); b23 = tl.load(bias_ptr + 23)
-    
-    # Apply scaling: scaled = inv_rms * alpha * acc + bias
-    # H_pre (0-3): alpha_pre
-    s0 = inv_rms * alpha_pre * acc0 + b0
-    s1 = inv_rms * alpha_pre * acc1 + b1
-    s2 = inv_rms * alpha_pre * acc2 + b2
-    s3 = inv_rms * alpha_pre * acc3 + b3
-    
-    # H_post (4-7): alpha_post
-    s4 = inv_rms * alpha_post * acc4 + b4
-    s5 = inv_rms * alpha_post * acc5 + b5
-    s6 = inv_rms * alpha_post * acc6 + b6
-    s7 = inv_rms * alpha_post * acc7 + b7
-    
-    # H_res (8-23): alpha_res
-    s8 = inv_rms * alpha_res * acc8 + b8
-    s9 = inv_rms * alpha_res * acc9 + b9
-    s10 = inv_rms * alpha_res * acc10 + b10
-    s11 = inv_rms * alpha_res * acc11 + b11
-    s12 = inv_rms * alpha_res * acc12 + b12
-    s13 = inv_rms * alpha_res * acc13 + b13
-    s14 = inv_rms * alpha_res * acc14 + b14
-    s15 = inv_rms * alpha_res * acc15 + b15
-    s16 = inv_rms * alpha_res * acc16 + b16
-    s17 = inv_rms * alpha_res * acc17 + b17
-    s18 = inv_rms * alpha_res * acc18 + b18
-    s19 = inv_rms * alpha_res * acc19 + b19
-    s20 = inv_rms * alpha_res * acc20 + b20
-    s21 = inv_rms * alpha_res * acc21 + b21
-    s22 = inv_rms * alpha_res * acc22 + b22
-    s23 = inv_rms * alpha_res * acc23 + b23
-    
-    # H_pre: sigmoid then normalize
-    sig0 = tl.sigmoid(s0); sig1 = tl.sigmoid(s1)
-    sig2 = tl.sigmoid(s2); sig3 = tl.sigmoid(s3)
-    pre_sum = sig0 + sig1 + sig2 + sig3 + eps
-    hp0 = sig0 / pre_sum; hp1 = sig1 / pre_sum
-    hp2 = sig2 / pre_sum; hp3 = sig3 / pre_sum
-    
-    # H_post: 2 * sigmoid  
-    hpost0 = 2.0 * tl.sigmoid(s4); hpost1 = 2.0 * tl.sigmoid(s5)
-    hpost2 = 2.0 * tl.sigmoid(s6); hpost3 = 2.0 * tl.sigmoid(s7)
-    
-    # Store H_pre
-    pre_base = H_pre_ptr + pid * 4
-    tl.store(pre_base + 0, hp0); tl.store(pre_base + 1, hp1)
-    tl.store(pre_base + 2, hp2); tl.store(pre_base + 3, hp3)
-    
-    # Store H_post
-    post_base = H_post_ptr + pid * 4
-    tl.store(post_base + 0, hpost0); tl.store(post_base + 1, hpost1)
-    tl.store(post_base + 2, hpost2); tl.store(post_base + 3, hpost3)
-    
-    # Store H_res (raw scaled values for Sinkhorn)
-    res_base = H_res_ptr + pid * 16
-    tl.store(res_base + 0, s8); tl.store(res_base + 1, s9)
-    tl.store(res_base + 2, s10); tl.store(res_base + 3, s11)
-    tl.store(res_base + 4, s12); tl.store(res_base + 5, s13)
-    tl.store(res_base + 6, s14); tl.store(res_base + 7, s15)
-    tl.store(res_base + 8, s16); tl.store(res_base + 9, s17)
-    tl.store(res_base + 10, s18); tl.store(res_base + 11, s19)
-    tl.store(res_base + 12, s20); tl.store(res_base + 13, s21)
-    tl.store(res_base + 14, s22); tl.store(res_base + 15, s23)
-
-
-# -----------------------------------------------------------------------------
 # Add Residual Kernel
 # Combines layer output with residual streams
 # -----------------------------------------------------------------------------
@@ -430,141 +223,8 @@ def _add_residual_kernel(
 
 
 # -----------------------------------------------------------------------------
-# Python Wrappers
-# -----------------------------------------------------------------------------
-
-def sinkhorn_forward(M: torch.Tensor, num_iters: int = 20, eps: float = 1e-8) -> torch.Tensor:
-    """Forward-only Sinkhorn-Knopp projection."""
-    assert M.shape[-2:] == (4, 4), "Expected (..., 4, 4)"
-    batch = M.shape[0]
-
-    M_out = M.contiguous().clone()
-    _sinkhorn_kernel[(batch,)](M_out, batch, num_iters=num_iters, eps=eps, NUM_STREAMS=4)
-    return M_out
-
-
-def stream_mix_forward(
-    H: torch.Tensor, H_pre: torch.Tensor, H_res: torch.Tensor, block_dim: int = 128,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Forward-only stream mixing."""
-    batch, seq, num_streams, dim = H.shape
-    assert num_streams == 4
-
-    H = H.contiguous()
-    H_pre = H_pre.contiguous()
-    H_res = H_res.contiguous()
-
-    branch_input = torch.empty(batch, seq, dim, device=H.device, dtype=H.dtype)
-    H_residual = torch.empty_like(H)
-
-    grid = (batch * seq, triton.cdiv(dim, block_dim))
-    _stream_mix_kernel[grid](
-        H, H_pre, H_res, branch_input, H_residual,
-        batch, seq, dim,
-        H.stride(0), H.stride(1), H.stride(2), H.stride(3),
-        branch_input.stride(0), branch_input.stride(1), branch_input.stride(2),
-        H_residual.stride(0), H_residual.stride(1), H_residual.stride(2), H_residual.stride(3),
-        BLOCK_DIM=block_dim,
-    )
-    return branch_input, H_residual
-
-
-def add_residual_forward(
-    H_residual: torch.Tensor, branch_output: torch.Tensor, H_post: torch.Tensor, block_dim: int = 128,
-) -> torch.Tensor:
-    """Forward-only residual addition."""
-    batch, seq, num_streams, dim = H_residual.shape
-    assert num_streams == 4
-
-    H_residual = H_residual.contiguous()
-    branch_output = branch_output.contiguous()
-    H_post = H_post.contiguous()
-
-    H_new = torch.empty_like(H_residual)
-    grid = (batch * seq, triton.cdiv(dim, block_dim))
-
-    _add_residual_kernel[grid](
-        H_residual, branch_output, H_post, H_new,
-        batch, seq, dim,
-        H_residual.stride(0), H_residual.stride(1), H_residual.stride(2), H_residual.stride(3),
-        branch_output.stride(0), branch_output.stride(1), branch_output.stride(2),
-        BLOCK_DIM=block_dim,
-    )
-    return H_new
-
-
-def fused_dynamic_weights_forward(
-    x: torch.Tensor,
-    phi: torch.Tensor,
-    bias: torch.Tensor,
-    alpha_pre: float,
-    alpha_post: float,
-    alpha_res: float,
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Fused forward pass for computing dynamic connection weights.
-    
-    Implements Eq. 14-19 from the paper using a fused Triton kernel:
-    1. Fused matmul + RMS norm: raw = x @ phi, r = ||x||_2 / sqrt(in_dim)
-    2. Scale + bias + activations in single pass
-    3. Sinkhorn-Knopp projection
-    
-    Args:
-        x: Input tensor [batch, in_dim] - mean-pooled flattened hyper-hidden
-        phi: Combined projection matrix [in_dim, n^2 + 2n]
-        bias: Combined bias [n^2 + 2n] (absorbs base params)
-        alpha_pre: Scale for H_pre projection
-        alpha_post: Scale for H_post projection
-        alpha_res: Scale for H_res projection
-        sinkhorn_iters: Iterations for doubly stochastic projection
-        eps: Numerical stability constant
-        
-    Returns:
-        H_pre: Pre-mixing weights [batch, n], normalized to sum=1
-        H_post: Post-distribution weights [batch, n], 2*sigmoid
-        H_res: Residual mixing matrix [batch, n, n], doubly stochastic
-    """
-    batch, in_dim = x.shape
-    n = 4  # num_streams
-    out_dim = n * n + 2 * n  # 24
-    
-    assert phi.shape == (in_dim, out_dim), f"phi shape mismatch: {phi.shape} vs ({in_dim}, {out_dim})"
-    assert bias.shape == (out_dim,), f"bias shape mismatch: {bias.shape} vs ({out_dim},)"
-    
-    # Ensure contiguous and float32
-    x = x.contiguous().float()
-    phi = phi.contiguous().float()
-    bias = bias.contiguous().float()
-    
-    # Allocate outputs
-    H_pre = torch.empty(batch, n, device=x.device, dtype=torch.float32)
-    H_post = torch.empty(batch, n, device=x.device, dtype=torch.float32)
-    H_res = torch.empty(batch, n, n, device=x.device, dtype=torch.float32)
-    
-    # Launch fused Triton kernel
-    grid = (batch,)
-    _fused_dynamic_weights_kernel[grid](
-        x, phi, bias,
-        alpha_pre, alpha_post, alpha_res,
-        H_pre, H_post, H_res,
-        batch, in_dim,
-        eps=eps,
-    )
-    
-    # Apply Sinkhorn-Knopp to H_res
-    H_res = sinkhorn_forward(H_res.contiguous(), sinkhorn_iters, eps)
-    
-    return H_pre.contiguous(), H_post.contiguous(), H_res.contiguous()
-
-
-# -----------------------------------------------------------------------------
-# Fully Fused Dynamic Weights Kernel V2 (Eq. 14-19)
-# Optimizations:
-# - Transposed phi layout for coalesced memory access
-# - Fully fused Sinkhorn (no separate kernel launch)
-# - Mixed-precision pipeline: BF16 input → FP32 compute → FP32 output
+# Fused Dynamic Weight Kernel (Eq. 14-19 from paper)
+# Fully fused: matmul + RMS norm + activations + Sinkhorn
 # -----------------------------------------------------------------------------
 
 @triton.autotune(
@@ -577,7 +237,7 @@ def fused_dynamic_weights_forward(
     key=['in_dim'],
 )
 @triton.jit
-def _fused_dynamic_weights_v2_kernel(
+def _fused_dynamic_weights_kernel(
     # Inputs
     x_ptr,              # [batch, in_dim] - flattened hyper-hidden (mean pooled)
     phi_t_ptr,          # [out_dim, in_dim] - TRANSPOSED for coalesced access
@@ -600,7 +260,7 @@ def _fused_dynamic_weights_v2_kernel(
     """
     Fully fused kernel implementing Eq. 14-19 with inline Sinkhorn.
     
-    Key optimizations over V1:
+    Optimizations:
     1. phi_t is transposed [24, in_dim] for coalesced row-wise loads
     2. Sinkhorn-Knopp runs in-kernel (no separate launch)
     3. Pipeline: load → cast BF16→FP32 → compute → store
@@ -643,7 +303,6 @@ def _fused_dynamic_weights_v2_kernel(
         norm_sq += tl.sum(x_vals * x_vals)
         
         # Load phi_t rows (COALESCED: each row is contiguous in memory)
-        # phi_t is [24, in_dim], row i starts at phi_t_ptr + i * in_dim
         phi0 = tl.load(phi_t_ptr + 0 * in_dim + k_offs, mask=k_mask, other=0.0).to(tl.float32)
         phi1 = tl.load(phi_t_ptr + 1 * in_dim + k_offs, mask=k_mask, other=0.0).to(tl.float32)
         phi2 = tl.load(phi_t_ptr + 2 * in_dim + k_offs, mask=k_mask, other=0.0).to(tl.float32)
@@ -765,7 +424,6 @@ def _fused_dynamic_weights_v2_kernel(
     tl.store(post_base + 2, hpost2); tl.store(post_base + 3, hpost3)
     
     # Eq. 19: Inline Sinkhorn-Knopp on H_res (s8-s23 form 4x4 matrix)
-    # Apply abs + eps (Sinkhorn requires positive values)
     m00 = tl.abs(s8) + eps;  m01 = tl.abs(s9) + eps
     m02 = tl.abs(s10) + eps; m03 = tl.abs(s11) + eps
     m10 = tl.abs(s12) + eps; m11 = tl.abs(s13) + eps
@@ -809,7 +467,71 @@ def _fused_dynamic_weights_v2_kernel(
     tl.store(res_base + 14, m32); tl.store(res_base + 15, m33)
 
 
-def fused_dynamic_weights_forward_v2(
+# -----------------------------------------------------------------------------
+# Python Wrappers
+# -----------------------------------------------------------------------------
+
+def sinkhorn_forward(M: torch.Tensor, num_iters: int = 20, eps: float = 1e-8) -> torch.Tensor:
+    """Forward-only Sinkhorn-Knopp projection."""
+    assert M.shape[-2:] == (4, 4), "Expected (..., 4, 4)"
+    batch = M.shape[0]
+
+    M_out = M.contiguous().clone()
+    _sinkhorn_kernel[(batch,)](M_out, batch, num_iters=num_iters, eps=eps, NUM_STREAMS=4)
+    return M_out
+
+
+def stream_mix_forward(
+    H: torch.Tensor, H_pre: torch.Tensor, H_res: torch.Tensor, block_dim: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Forward-only stream mixing."""
+    batch, seq, num_streams, dim = H.shape
+    assert num_streams == 4
+
+    H = H.contiguous()
+    H_pre = H_pre.contiguous()
+    H_res = H_res.contiguous()
+
+    branch_input = torch.empty(batch, seq, dim, device=H.device, dtype=H.dtype)
+    H_residual = torch.empty_like(H)
+
+    grid = (batch * seq, triton.cdiv(dim, block_dim))
+    _stream_mix_kernel[grid](
+        H, H_pre, H_res, branch_input, H_residual,
+        batch, seq, dim,
+        H.stride(0), H.stride(1), H.stride(2), H.stride(3),
+        branch_input.stride(0), branch_input.stride(1), branch_input.stride(2),
+        H_residual.stride(0), H_residual.stride(1), H_residual.stride(2), H_residual.stride(3),
+        BLOCK_DIM=block_dim,
+    )
+    return branch_input, H_residual
+
+
+def add_residual_forward(
+    H_residual: torch.Tensor, branch_output: torch.Tensor, H_post: torch.Tensor, block_dim: int = 128,
+) -> torch.Tensor:
+    """Forward-only residual addition."""
+    batch, seq, num_streams, dim = H_residual.shape
+    assert num_streams == 4
+
+    H_residual = H_residual.contiguous()
+    branch_output = branch_output.contiguous()
+    H_post = H_post.contiguous()
+
+    H_new = torch.empty_like(H_residual)
+    grid = (batch * seq, triton.cdiv(dim, block_dim))
+
+    _add_residual_kernel[grid](
+        H_residual, branch_output, H_post, H_new,
+        batch, seq, dim,
+        H_residual.stride(0), H_residual.stride(1), H_residual.stride(2), H_residual.stride(3),
+        branch_output.stride(0), branch_output.stride(1), branch_output.stride(2),
+        BLOCK_DIM=block_dim,
+    )
+    return H_new
+
+
+def fused_dynamic_weights_forward(
     x: torch.Tensor,
     phi: torch.Tensor,
     bias: torch.Tensor,
@@ -820,16 +542,16 @@ def fused_dynamic_weights_forward_v2(
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Fully fused forward pass for dynamic connection weights (V2).
+    Fused forward pass for computing dynamic connection weights (Eq. 14-19).
     
-    Improvements over V1:
+    Optimizations:
     - Transposed phi layout for coalesced memory access
     - Sinkhorn-Knopp fused inline (no separate kernel launch)
-    - Single kernel computes Eq. 14-19 completely
+    - Single kernel computes all operations
     
     Args:
         x: Input tensor [batch, in_dim] - mean-pooled flattened hyper-hidden
-        phi: Combined projection matrix [in_dim, n^2 + 2n] (will be transposed internally)
+        phi: Combined projection matrix [in_dim, n^2 + 2n]
         bias: Combined bias [n^2 + 2n] (absorbs base params)
         alpha_pre: Scale for H_pre projection
         alpha_post: Scale for H_post projection
@@ -863,7 +585,7 @@ def fused_dynamic_weights_forward_v2(
     
     # Launch fully fused kernel (includes Sinkhorn)
     grid = (batch,)
-    _fused_dynamic_weights_v2_kernel[grid](
+    _fused_dynamic_weights_kernel[grid](
         x, phi_t, bias,
         alpha_pre, alpha_post, alpha_res,
         H_pre, H_post, H_res,
@@ -873,4 +595,3 @@ def fused_dynamic_weights_forward_v2(
     )
     
     return H_pre.contiguous(), H_post.contiguous(), H_res.contiguous()
-

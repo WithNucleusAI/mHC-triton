@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Callable
 
-from .ops import sinkhorn_knopp, fused_stream_mix, fused_add_residual, fused_dynamic_weights_v2
+from .ops import sinkhorn_knopp, fused_stream_mix, fused_add_residual, fused_dynamic_weights
 
 
 class HyperConnection(nn.Module):
@@ -127,7 +127,7 @@ class HyperConnection(nn.Module):
                 self.H_res_base.flatten(),
             ])
             
-            H_pre, H_post, H_res = fused_dynamic_weights_v2(
+            H_pre, H_post, H_res = fused_dynamic_weights(
                 x, self.phi, bias,
                 self.alpha_pre, self.alpha_post, self.alpha_res,
                 self.sinkhorn_iters, self.eps,

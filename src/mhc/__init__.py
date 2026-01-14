@@ -13,7 +13,6 @@ from .ops import (
     fused_stream_mix,
     fused_add_residual,
     fused_dynamic_weights,
-    fused_dynamic_weights_v2,
 )
 from ._torch_baseline import (
     sinkhorn_knopp_torch,
@@ -30,7 +29,6 @@ __all__ = [
     "fused_stream_mix",
     "fused_add_residual",
     "fused_dynamic_weights",
-    "fused_dynamic_weights_v2",  # V2 with fully fused Sinkhorn
     # PyTorch baselines for benchmarking
     "sinkhorn_knopp_torch",
     "fused_stream_mix_torch",
@@ -38,4 +36,3 @@ __all__ = [
     "fused_dynamic_weights_torch",
     "HyperConnectionTorch",
 ]
-
