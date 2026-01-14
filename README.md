@@ -76,6 +76,8 @@ H (batch, seq, 4, dim)
 
 This implementation incorporates the efficiency techniques from Section 4.3 of the mHC paper:
 
+![Optimizations from the mHC paper](optimizations.png)
+
 ### 1. Fused Dynamic Weight Kernel (Eq. 14-19)
 
 Instead of separate operations for projection, normalization, and activation, we fuse everything into a single kernel:
