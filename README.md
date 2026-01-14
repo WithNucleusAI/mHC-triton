@@ -2,7 +2,7 @@
 
 **Manifold-Constrained Hyper-Connections** with fused Triton kernels for efficient training.
 
-Created by [NucleusAI](https://github.com/WithNucleusAI) • Authors: Chandan Akiti & Sai Ajay Modukuri
+Created by [NucleusAI](https://github.com/WithNucleusAI)
 
 Based on the paper: [Hyper-Connections](https://arxiv.org/html/2512.24880) by the DeepSeek team
 
