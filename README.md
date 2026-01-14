@@ -10,7 +10,6 @@ Based on the paper: [Hyper-Connections](https://arxiv.org/html/2512.24880) by th
 
 - **Fused Triton kernels** implementing paper's Section 4.3 optimizations
 - **6.2x faster** full forward+backward vs PyTorch baseline
-- **1.8x memory reduction** via backward recomputation
 - **3.4x overhead** vs simple residual 
 - **Full autograd support** for training
 
