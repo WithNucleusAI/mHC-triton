@@ -2,7 +2,7 @@
 
 **Manifold-Constrained Hyper-Connections** with fused Triton kernels for efficient training.
 
-Created by [NucleusAI](https://github.com/NucleusAI) • Authors: Chandan Akiti & Sai Ajay Modukuri
+Created by [NucleusAI](https://github.com/WithNucleusAI) • Authors: Chandan Akiti & Sai Ajay Modukuri
 
 Based on the paper: [Hyper-Connections](https://arxiv.org/html/2512.24880) by the DeepSeek team
 
@@ -10,7 +10,7 @@ Based on the paper: [Hyper-Connections](https://arxiv.org/html/2512.24880) by th
 
 - **Fused Triton kernels** optimized for NVIDIA H100
 - **4x4 stream mixing matrices** kept in registers
-- **20x memory reduction** via backward recomputation
+- **1.8x memory reduction** via backward recomputation
 - **Full autograd support** for training
 
 ## Installation
@@ -103,15 +103,23 @@ H_new = fused_add_residual(H_residual, branch_output, H_post)
 
 ## Performance
 
-Benchmarks on H100 SXM5 (batch=8, seq=2048, dim=4096):
+Benchmarks on NVIDIA H100 80GB HBM3 (batch=16, seq=2048, dim=4096):
+
+### Speed
 
 | Operation | PyTorch | Triton | Speedup |
 |-----------|---------|--------|---------|
-| Sinkhorn (20 iter) | 0.42ms | 0.08ms | 5.2x |
-| Stream Mix | 1.85ms | 0.32ms | 5.8x |
-| Full Forward+Backward | 8.2ms | 1.9ms | 4.3x |
+| Sinkhorn (20 iter) | 0.73ms | 0.47ms | 1.6x |
+| Stream Mix | 8.54ms | 1.00ms | 8.6x |
+| Add Residual | 2.57ms | 0.89ms | 2.9x |
+| Full Forward+Backward | 88.48ms | 60.43ms | 1.5x |
 
-Memory savings from recomputation: **20x** for Sinkhorn backward.
+### Memory
+
+| Operation | PyTorch | Triton | Savings |
+|-----------|---------|--------|---------|
+| Sinkhorn Backward | 120.0MB | 68.0MB | 1.8x |
+| Full Forward+Backward | 8004.6MB | 6723.3MB | 1.2x |
 
 ## Requirements
 
