@@ -1,11 +1,20 @@
 """Forward Triton kernels for Manifold-Constrained Hyper-Connections.
 
-Optimizations from DeepSeek mHC paper Section 4.3:
-- Fused operations to minimize kernel launches
-- Transposed phi layout for coalesced memory access
-- Inline Sinkhorn-Knopp (no separate kernel)
-- 4x4 matrices kept in registers
-- Mixed-precision: BF16 input → FP32 compute → FP32 output
+This module implements optimized GPU kernels for the mHC paper's forward pass:
+https://arxiv.org/html/2512.24880
+
+Key optimizations from Section 4.3:
+- Fused operations to minimize kernel launches and memory traffic
+- Transposed weight matrix layout for coalesced memory access
+- Inline Sinkhorn-Knopp (eliminates separate kernel launch)
+- 4x4 matrices kept entirely in registers (16 scalars per batch)
+- Mixed-precision pipeline: BF16/FP16 input → FP32 compute → FP32 output
+
+Kernel Overview:
+- _sinkhorn_kernel: Project matrices to doubly stochastic
+- _stream_mix_kernel: Compute weighted stream mixing (Eq. 10-11)
+- _add_residual_kernel: Distribute layer output to streams (Eq. 12)
+- _fused_dynamic_weights_kernel: Compute H_pre, H_post, H_res (Eq. 14-19)
 """
 
 import torch
@@ -14,10 +23,9 @@ import triton.language as tl
 from typing import Tuple
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Sinkhorn-Knopp Kernel
-# Projects matrices to doubly stochastic (all rows/cols sum to 1)
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 @triton.jit
 def _sinkhorn_kernel(
@@ -27,7 +35,36 @@ def _sinkhorn_kernel(
     eps: tl.constexpr,
     NUM_STREAMS: tl.constexpr,
 ):
-    """Projects (batch, 4, 4) matrices to doubly stochastic in-place."""
+    """
+    Project matrices to doubly stochastic via Sinkhorn-Knopp iteration.
+    
+    Operates in-place on a batch of 4x4 matrices, alternating between
+    row and column normalization until convergence.
+    
+    Algorithm:
+        1. Apply abs() + eps to ensure positive entries
+        2. For each iteration:
+           - Normalize rows to sum to 1
+           - Normalize columns to sum to 1
+        3. Result: doubly stochastic matrix (rows and cols sum to 1)
+    
+    Grid: (batch,) - one program per batch element
+    
+    Memory Layout:
+        M_ptr points to contiguous [batch, 4, 4] tensor in row-major order.
+        Each 4x4 matrix is stored as 16 consecutive floats.
+    
+    Args:
+        M_ptr: Pointer to input/output tensor [batch, 4, 4]
+        batch: Batch size
+        num_iters: Number of row/column normalization iterations (constexpr)
+        eps: Small constant for numerical stability (constexpr)
+        NUM_STREAMS: Must be 4 (constexpr, for static unrolling)
+    
+    Note:
+        Entire 4x4 matrix is kept in 16 scalar registers for maximum performance.
+        This avoids shared memory and enables efficient in-register computation.
+    """
     pid = tl.program_id(0)
     if pid >= batch:
         return
@@ -54,7 +91,7 @@ def _sinkhorn_kernel(
 
     # Alternating row/column normalization
     for _ in range(num_iters):
-        # Row normalization
+        # Row normalization: each row sums to 1
         r0 = m00 + m01 + m02 + m03 + eps
         r1 = m10 + m11 + m12 + m13 + eps
         r2 = m20 + m21 + m22 + m23 + eps
@@ -64,7 +101,7 @@ def _sinkhorn_kernel(
         m20 /= r2; m21 /= r2; m22 /= r2; m23 /= r2
         m30 /= r3; m31 /= r3; m32 /= r3; m33 /= r3
 
-        # Column normalization
+        # Column normalization: each column sums to 1
         c0 = m00 + m10 + m20 + m30 + eps
         c1 = m01 + m11 + m21 + m31 + eps
         c2 = m02 + m12 + m22 + m32 + eps
@@ -93,10 +130,9 @@ def _sinkhorn_kernel(
     tl.store(M_ptr + base + 15, m33)
 
 
-# -----------------------------------------------------------------------------
-# Stream Mixing Kernel
-# Computes branch_input and H_residual in a single pass
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Stream Mixing Kernel (Eq. 10-11)
+# =============================================================================
 
 @triton.jit
 def _stream_mix_kernel(
@@ -109,9 +145,36 @@ def _stream_mix_kernel(
     BLOCK_DIM: tl.constexpr,
 ):
     """
-    Computes:
-    - branch_input = einsum('bn,bsnd->bsd', H_pre, H)
-    - H_residual = einsum('bnm,bsmd->bsnd', H_res, H)
+    Fused stream mixing: compute branch_input and H_residual in one pass.
+    
+    Implements Eq. 10-11 from the mHC paper:
+        branch_input[b,s,d] = sum_n(H_pre[b,n] * H[b,s,n,d])      (Eq. 10)
+        H_residual[b,s,n,d] = sum_m(H_res[b,n,m] * H[b,s,m,d])    (Eq. 11)
+    
+    Grid: (batch * seq, cdiv(dim, BLOCK_DIM))
+        - First axis: one program per (batch, sequence) pair
+        - Second axis: tiles over hidden dimension
+    
+    Memory Access Pattern:
+        - H: Strided access across streams (4 loads per position)
+        - H_pre: Broadcast across sequence and dimension (4 scalars per batch)
+        - H_res: Broadcast across sequence and dimension (16 scalars per batch)
+        - Outputs: Coalesced writes along dimension
+    
+    Args:
+        H_ptr: Input hyper-hidden [batch, seq, 4, dim]
+        H_pre_ptr: Pre-mixing weights [batch, 4], normalized to sum=1
+        H_res_ptr: Residual mixing matrix [batch, 4, 4], doubly stochastic
+        branch_input_ptr: Output weighted sum [batch, seq, dim]
+        H_residual_ptr: Output mixed residual [batch, seq, 4, dim]
+        batch, seq, dim: Tensor dimensions
+        stride_*: Memory strides for each tensor
+        BLOCK_DIM: Tile size for dimension axis (constexpr)
+    
+    Performance Notes:
+        - H_pre (4 values) and H_res (16 values) are loaded once per (batch, seq)
+        - All 4 streams processed together to maximize register reuse
+        - BLOCK_DIM=128 typically optimal for modern GPUs
     """
     pid_bs = tl.program_id(0)
     pid_d = tl.program_id(1)
@@ -122,26 +185,26 @@ def _stream_mix_kernel(
     d_offs = pid_d * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
     d_mask = d_offs < dim
 
-    # Load H[b,s,:,d_offs]
+    # Load H[b,s,:,d_offs] - all 4 streams for this position
     h_base = H_ptr + b * stride_h_b + s * stride_h_s
     h0 = tl.load(h_base + 0 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     h1 = tl.load(h_base + 1 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     h2 = tl.load(h_base + 2 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     h3 = tl.load(h_base + 3 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
 
-    # Load H_pre[b,:]
+    # Load H_pre[b,:] - pre-mixing weights (sum to 1)
     hp_base = H_pre_ptr + b * 4
     hp0 = tl.load(hp_base + 0).to(tl.float32)
     hp1 = tl.load(hp_base + 1).to(tl.float32)
     hp2 = tl.load(hp_base + 2).to(tl.float32)
     hp3 = tl.load(hp_base + 3).to(tl.float32)
 
-    # branch_input = weighted sum of streams
+    # Eq. 10: branch_input = weighted sum of streams
     branch = hp0 * h0 + hp1 * h1 + hp2 * h2 + hp3 * h3
     bi_base = branch_input_ptr + b * stride_bi_b + s * stride_bi_s
     tl.store(bi_base + d_offs * stride_bi_d, branch, mask=d_mask)
 
-    # Load H_res[b,:,:] (4x4 matrix)
+    # Load H_res[b,:,:] - 4x4 doubly stochastic matrix
     hr_base = H_res_ptr + b * 16
     hr00 = tl.load(hr_base + 0).to(tl.float32)
     hr01 = tl.load(hr_base + 1).to(tl.float32)
@@ -160,7 +223,7 @@ def _stream_mix_kernel(
     hr32 = tl.load(hr_base + 14).to(tl.float32)
     hr33 = tl.load(hr_base + 15).to(tl.float32)
 
-    # H_residual = H_res @ H (matrix-vector per stream)
+    # Eq. 11: H_residual = H_res @ H (matrix-vector product per stream)
     out0 = hr00 * h0 + hr01 * h1 + hr02 * h2 + hr03 * h3
     out1 = hr10 * h0 + hr11 * h1 + hr12 * h2 + hr13 * h3
     out2 = hr20 * h0 + hr21 * h1 + hr22 * h2 + hr23 * h3
@@ -173,10 +236,10 @@ def _stream_mix_kernel(
     tl.store(out_base + 3 * stride_hr_n + d_offs * stride_hr_d, out3, mask=d_mask)
 
 
-# -----------------------------------------------------------------------------
-# Add Residual Kernel
+# =============================================================================
+# Add Residual Kernel (Eq. 12)
 # Combines layer output with residual streams
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 @triton.jit
 def _add_residual_kernel(
@@ -186,7 +249,32 @@ def _add_residual_kernel(
     stride_bo_b, stride_bo_s, stride_bo_d,
     BLOCK_DIM: tl.constexpr,
 ):
-    """H_new[n] = H_residual[n] + H_post[n] * branch_output"""
+    """
+    Distribute layer output to streams and add to residual.
+    
+    Implements Eq. 12 from the mHC paper:
+        H_new[b,s,n,d] = H_residual[b,s,n,d] + H_post[b,n] * branch_output[b,s,d]
+    
+    This distributes the layer's output back to all streams, weighted by H_post,
+    then adds the residual connection.
+    
+    Grid: (batch * seq, cdiv(dim, BLOCK_DIM))
+        - First axis: one program per (batch, sequence) pair
+        - Second axis: tiles over hidden dimension
+    
+    Args:
+        H_residual_ptr: Residual streams [batch, seq, 4, dim] from stream_mix
+        branch_output_ptr: Layer output [batch, seq, dim]
+        H_post_ptr: Post-distribution weights [batch, 4], values in (0, 2)
+        H_new_ptr: Output updated hyper-hidden [batch, seq, 4, dim]
+        batch, seq, dim: Tensor dimensions
+        stride_*: Memory strides for each tensor
+        BLOCK_DIM: Tile size for dimension axis (constexpr)
+    
+    Note:
+        H_post values are in (0, 2) from 2*sigmoid activation, allowing the
+        layer output to be amplified or attenuated per stream.
+    """
     pid_bs = tl.program_id(0)
     pid_d = tl.program_id(1)
 
@@ -196,11 +284,11 @@ def _add_residual_kernel(
     d_offs = pid_d * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
     d_mask = d_offs < dim
 
-    # Load branch_output
+    # Load branch_output[b,s,d_offs]
     bo_base = branch_output_ptr + b * stride_bo_b + s * stride_bo_s
     branch = tl.load(bo_base + d_offs * stride_bo_d, mask=d_mask, other=0.0).to(tl.float32)
 
-    # Load H_post[b,:]
+    # Load H_post[b,:] - post-distribution weights
     hp_base = H_post_ptr + b * 4
     hp0 = tl.load(hp_base + 0).to(tl.float32)
     hp1 = tl.load(hp_base + 1).to(tl.float32)
@@ -210,7 +298,7 @@ def _add_residual_kernel(
     hr_base = H_residual_ptr + b * stride_h_b + s * stride_h_s
     hn_base = H_new_ptr + b * stride_h_b + s * stride_h_s
 
-    # H_new[n] = H_residual[n] + H_post[n] * branch_output
+    # Eq. 12: H_new[n] = H_residual[n] + H_post[n] * branch_output
     hr0 = tl.load(hr_base + 0 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     hr1 = tl.load(hr_base + 1 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     hr2 = tl.load(hr_base + 2 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
@@ -222,10 +310,10 @@ def _add_residual_kernel(
     tl.store(hn_base + 3 * stride_h_n + d_offs * stride_h_d, hr3 + hp3 * branch, mask=d_mask)
 
 
-# -----------------------------------------------------------------------------
-# Fused Dynamic Weight Kernel (Eq. 14-19 from paper)
+# =============================================================================
+# Fused Dynamic Weight Kernel (Eq. 14-19)
 # Fully fused: matmul + RMS norm + activations + Sinkhorn
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 @triton.autotune(
     configs=[
@@ -241,17 +329,17 @@ def _fused_dynamic_weights_kernel(
     # Inputs
     x_ptr,              # [batch, in_dim] - flattened hyper-hidden (mean pooled)
     phi_t_ptr,          # [out_dim, in_dim] - TRANSPOSED for coalesced access
-    bias_ptr,           # [out_dim] - combined bias
-    alpha_pre,          # scalar
-    alpha_post,         # scalar
-    alpha_res,          # scalar
+    bias_ptr,           # [out_dim] - combined bias (base params)
+    alpha_pre,          # scalar - scale for H_pre
+    alpha_post,         # scalar - scale for H_post
+    alpha_res,          # scalar - scale for H_res
     # Outputs
-    H_pre_ptr,          # [batch, n]
-    H_post_ptr,         # [batch, n]
-    H_res_ptr,          # [batch, n, n] - fully processed (post-Sinkhorn)
+    H_pre_ptr,          # [batch, n] - pre-mixing weights
+    H_post_ptr,         # [batch, n] - post-distribution weights
+    H_res_ptr,          # [batch, n, n] - residual matrix (post-Sinkhorn)
     # Dimensions
     batch,
-    in_dim,             # nC (e.g., 16384)
+    in_dim,             # nC (e.g., 4*4096 = 16384)
     # Constants
     BLOCK_K: tl.constexpr,
     sinkhorn_iters: tl.constexpr,
@@ -260,16 +348,45 @@ def _fused_dynamic_weights_kernel(
     """
     Fully fused kernel implementing Eq. 14-19 with inline Sinkhorn.
     
-    Optimizations:
-    1. phi_t is transposed [24, in_dim] for coalesced row-wise loads
-    2. Sinkhorn-Knopp runs in-kernel (no separate launch)
-    3. Pipeline: load → cast BF16→FP32 → compute → store
+    This kernel computes all three dynamic connection weights (H_pre, H_post, H_res)
+    from the mean-pooled hyper-hidden state in a single pass, including the
+    Sinkhorn-Knopp projection for H_res.
     
-    One program per batch element. Computes:
-    1. x @ phi^T (matmul with transposed phi for coalesced access)
-    2. ||x||_2 / sqrt(in_dim) (RMS norm, computed during matmul)
-    3. Scale + bias + activations
-    4. Sinkhorn-Knopp projection (inline, no extra kernel)
+    Mathematical Operations (from paper):
+        Eq. 14: raw = x @ phi                      (linear projection)
+        Eq. 15: r = ||x||_2 / sqrt(in_dim)         (RMS norm factor)
+        Eq. 16: scaled = (1/r) * alpha * raw + bias (scale and shift)
+        Eq. 17: H_pre = normalize(sigmoid(scaled[:n]))
+        Eq. 18: H_post = 2 * sigmoid(scaled[n:2n])
+        Eq. 19: H_res = Sinkhorn(scaled[2n:])
+    
+    Key Optimizations:
+        1. Transposed phi layout [24, in_dim] for coalesced memory reads
+        2. Fused RMS norm computation during matmul (single pass over x)
+        3. Inline Sinkhorn-Knopp (no separate kernel launch)
+        4. 24 scalar accumulators fit in registers
+    
+    Grid: (batch,) - one program per batch element
+    
+    Memory Access:
+        - x: Sequential read in BLOCK_K chunks (coalesced)
+        - phi_t: 24 coalesced row reads per chunk (each row is contiguous)
+        - bias: Single read of 24 values at kernel end
+        - Output: 24 scalar writes per batch element
+    
+    Args:
+        x_ptr: Mean-pooled input [batch, n*dim], contiguous
+        phi_t_ptr: Transposed projection [24, n*dim] for coalesced access
+        bias_ptr: Combined bias [24] = [H_pre_base, H_post_base, H_res_base.flatten()]
+        alpha_pre/post/res: Learnable scaling factors for each output group
+        H_pre_ptr: Output [batch, 4], normalized to sum=1
+        H_post_ptr: Output [batch, 4], values in (0, 2)
+        H_res_ptr: Output [batch, 4, 4], doubly stochastic
+        batch: Batch size
+        in_dim: Input dimension (n * hidden_dim)
+        BLOCK_K: Tile size for reduction (auto-tuned)
+        sinkhorn_iters: Number of Sinkhorn iterations (typically 20)
+        eps: Numerical stability constant
     """
     pid = tl.program_id(0)
     if pid >= batch:
@@ -279,30 +396,32 @@ def _fused_dynamic_weights_kernel(
     OUT_DIM: tl.constexpr = 24  # n^2 + 2n for n=4
     N: tl.constexpr = 4
     
-    # Initialize 24 accumulators and norm accumulator
+    # Initialize 24 accumulators for matmul output
     acc0 = 0.0; acc1 = 0.0; acc2 = 0.0; acc3 = 0.0
     acc4 = 0.0; acc5 = 0.0; acc6 = 0.0; acc7 = 0.0
     acc8 = 0.0; acc9 = 0.0; acc10 = 0.0; acc11 = 0.0
     acc12 = 0.0; acc13 = 0.0; acc14 = 0.0; acc15 = 0.0
     acc16 = 0.0; acc17 = 0.0; acc18 = 0.0; acc19 = 0.0
     acc20 = 0.0; acc21 = 0.0; acc22 = 0.0; acc23 = 0.0
-    norm_sq = 0.0
+    norm_sq = 0.0  # For RMS norm: sum(x^2)
     
-    # Base pointers
+    # Base pointer for this batch element
     x_base = x_ptr + pid * in_dim
     
     # Stream through input dimension with coalesced phi access
+    # This computes both the matmul and the norm in a single pass
     for k_start in range(0, in_dim, BLOCK_K):
         k_offs = k_start + tl.arange(0, BLOCK_K)
         k_mask = k_offs < in_dim
         
-        # Load x block (contiguous)
+        # Load x block (contiguous read)
         x_vals = tl.load(x_base + k_offs, mask=k_mask, other=0.0).to(tl.float32)
         
-        # Accumulate squared norm
+        # Accumulate squared norm for RMS
         norm_sq += tl.sum(x_vals * x_vals)
         
-        # Load phi_t rows (COALESCED: each row is contiguous in memory)
+        # Load phi_t rows (COALESCED: each row [i,:] is contiguous in memory)
+        # phi_t layout: [24, in_dim] where row i contains phi[:, i].T
         phi0 = tl.load(phi_t_ptr + 0 * in_dim + k_offs, mask=k_mask, other=0.0).to(tl.float32)
         phi1 = tl.load(phi_t_ptr + 1 * in_dim + k_offs, mask=k_mask, other=0.0).to(tl.float32)
         phi2 = tl.load(phi_t_ptr + 2 * in_dim + k_offs, mask=k_mask, other=0.0).to(tl.float32)
@@ -328,7 +447,7 @@ def _fused_dynamic_weights_kernel(
         phi22 = tl.load(phi_t_ptr + 22 * in_dim + k_offs, mask=k_mask, other=0.0).to(tl.float32)
         phi23 = tl.load(phi_t_ptr + 23 * in_dim + k_offs, mask=k_mask, other=0.0).to(tl.float32)
         
-        # Accumulate dot products
+        # Accumulate dot products (Eq. 14: raw = x @ phi)
         acc0 += tl.sum(x_vals * phi0)
         acc1 += tl.sum(x_vals * phi1)
         acc2 += tl.sum(x_vals * phi2)
@@ -354,10 +473,12 @@ def _fused_dynamic_weights_kernel(
         acc22 += tl.sum(x_vals * phi22)
         acc23 += tl.sum(x_vals * phi23)
     
-    # Eq. 15-16: Compute RMS factor and apply scaling
+    # Eq. 15-16: Compute inverse RMS and apply scaling
+    # RMSNorm: x_norm = x / sqrt(mean(x^2) + eps)
+    # We reorder: scaled = (1/r) * alpha * raw + bias where r = sqrt(norm_sq/dim + eps)
     inv_rms = 1.0 / tl.sqrt(norm_sq / in_dim + eps)
     
-    # Load biases
+    # Load biases (base parameters)
     b0 = tl.load(bias_ptr + 0); b1 = tl.load(bias_ptr + 1)
     b2 = tl.load(bias_ptr + 2); b3 = tl.load(bias_ptr + 3)
     b4 = tl.load(bias_ptr + 4); b5 = tl.load(bias_ptr + 5)
@@ -371,20 +492,18 @@ def _fused_dynamic_weights_kernel(
     b20 = tl.load(bias_ptr + 20); b21 = tl.load(bias_ptr + 21)
     b22 = tl.load(bias_ptr + 22); b23 = tl.load(bias_ptr + 23)
     
-    # Apply scaling: scaled = inv_rms * alpha * acc + bias
-    # H_pre (0-3): alpha_pre
+    # Eq. 16: Apply scaling - scaled = inv_rms * alpha * acc + bias
+    # H_pre uses indices 0-3, H_post uses 4-7, H_res uses 8-23
     s0 = inv_rms * alpha_pre * acc0 + b0
     s1 = inv_rms * alpha_pre * acc1 + b1
     s2 = inv_rms * alpha_pre * acc2 + b2
     s3 = inv_rms * alpha_pre * acc3 + b3
     
-    # H_post (4-7): alpha_post
     s4 = inv_rms * alpha_post * acc4 + b4
     s5 = inv_rms * alpha_post * acc5 + b5
     s6 = inv_rms * alpha_post * acc6 + b6
     s7 = inv_rms * alpha_post * acc7 + b7
     
-    # H_res (8-23): alpha_res - these go through Sinkhorn
     s8 = inv_rms * alpha_res * acc8 + b8
     s9 = inv_rms * alpha_res * acc9 + b9
     s10 = inv_rms * alpha_res * acc10 + b10
@@ -402,14 +521,16 @@ def _fused_dynamic_weights_kernel(
     s22 = inv_rms * alpha_res * acc22 + b22
     s23 = inv_rms * alpha_res * acc23 + b23
     
-    # Eq. 17: H_pre = sigmoid then normalize to sum=1
+    # Eq. 17: H_pre = normalize(sigmoid(s0:s3))
+    # Pre-mixing weights sum to 1
     sig0 = tl.sigmoid(s0); sig1 = tl.sigmoid(s1)
     sig2 = tl.sigmoid(s2); sig3 = tl.sigmoid(s3)
     pre_sum = sig0 + sig1 + sig2 + sig3 + eps
     hp0 = sig0 / pre_sum; hp1 = sig1 / pre_sum
     hp2 = sig2 / pre_sum; hp3 = sig3 / pre_sum
     
-    # Eq. 18: H_post = 2 * sigmoid
+    # Eq. 18: H_post = 2 * sigmoid(s4:s7)
+    # Post-distribution weights in (0, 2)
     hpost0 = 2.0 * tl.sigmoid(s4); hpost1 = 2.0 * tl.sigmoid(s5)
     hpost2 = 2.0 * tl.sigmoid(s6); hpost3 = 2.0 * tl.sigmoid(s7)
     
@@ -423,7 +544,9 @@ def _fused_dynamic_weights_kernel(
     tl.store(post_base + 0, hpost0); tl.store(post_base + 1, hpost1)
     tl.store(post_base + 2, hpost2); tl.store(post_base + 3, hpost3)
     
-    # Eq. 19: Inline Sinkhorn-Knopp on H_res (s8-s23 form 4x4 matrix)
+    # Eq. 19: H_res = Sinkhorn(s8:s23)
+    # Inline Sinkhorn-Knopp projection to doubly stochastic matrix
+    # Apply abs() + eps to ensure positive entries
     m00 = tl.abs(s8) + eps;  m01 = tl.abs(s9) + eps
     m02 = tl.abs(s10) + eps; m03 = tl.abs(s11) + eps
     m10 = tl.abs(s12) + eps; m11 = tl.abs(s13) + eps
@@ -433,7 +556,7 @@ def _fused_dynamic_weights_kernel(
     m30 = tl.abs(s20) + eps; m31 = tl.abs(s21) + eps
     m32 = tl.abs(s22) + eps; m33 = tl.abs(s23) + eps
     
-    # Sinkhorn-Knopp iterations (alternating row/column normalization)
+    # Alternating row/column normalization (Sinkhorn iterations)
     for _ in range(sinkhorn_iters):
         # Row normalization
         r0 = m00 + m01 + m02 + m03 + eps
@@ -455,7 +578,7 @@ def _fused_dynamic_weights_kernel(
         m02 /= c2; m12 /= c2; m22 /= c2; m32 /= c2
         m03 /= c3; m13 /= c3; m23 /= c3; m33 /= c3
     
-    # Store H_res (doubly stochastic)
+    # Store H_res (doubly stochastic: rows and columns sum to 1)
     res_base = H_res_ptr + pid * 16
     tl.store(res_base + 0, m00); tl.store(res_base + 1, m01)
     tl.store(res_base + 2, m02); tl.store(res_base + 3, m03)
@@ -467,12 +590,22 @@ def _fused_dynamic_weights_kernel(
     tl.store(res_base + 14, m32); tl.store(res_base + 15, m33)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Python Wrappers
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 def sinkhorn_forward(M: torch.Tensor, num_iters: int = 20, eps: float = 1e-8) -> torch.Tensor:
-    """Forward-only Sinkhorn-Knopp projection."""
+    """
+    Project matrices to doubly stochastic via Sinkhorn-Knopp.
+    
+    Args:
+        M: Input tensor [batch, 4, 4]
+        num_iters: Number of row/column normalization iterations
+        eps: Small constant for numerical stability
+        
+    Returns:
+        Doubly stochastic tensor [batch, 4, 4] where all rows and columns sum to 1
+    """
     assert M.shape[-2:] == (4, 4), "Expected (..., 4, 4)"
     batch = M.shape[0]
 
@@ -484,7 +617,19 @@ def sinkhorn_forward(M: torch.Tensor, num_iters: int = 20, eps: float = 1e-8) ->
 def stream_mix_forward(
     H: torch.Tensor, H_pre: torch.Tensor, H_res: torch.Tensor, block_dim: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Forward-only stream mixing."""
+    """
+    Compute stream mixing (Eq. 10-11).
+    
+    Args:
+        H: Hyper-hidden state [batch, seq, 4, dim]
+        H_pre: Pre-mixing weights [batch, 4], should sum to 1
+        H_res: Residual mixing matrix [batch, 4, 4], doubly stochastic
+        block_dim: Tile size for dimension axis
+        
+    Returns:
+        branch_input: Weighted sum of streams [batch, seq, dim]
+        H_residual: Mixed residual streams [batch, seq, 4, dim]
+    """
     batch, seq, num_streams, dim = H.shape
     assert num_streams == 4
 
@@ -510,7 +655,18 @@ def stream_mix_forward(
 def add_residual_forward(
     H_residual: torch.Tensor, branch_output: torch.Tensor, H_post: torch.Tensor, block_dim: int = 128,
 ) -> torch.Tensor:
-    """Forward-only residual addition."""
+    """
+    Distribute layer output to streams and add residual (Eq. 12).
+    
+    Args:
+        H_residual: Residual streams [batch, seq, 4, dim]
+        branch_output: Layer output [batch, seq, dim]
+        H_post: Post-distribution weights [batch, 4], values in (0, 2)
+        block_dim: Tile size for dimension axis
+        
+    Returns:
+        H_new: Updated hyper-hidden [batch, seq, 4, dim]
+    """
     batch, seq, num_streams, dim = H_residual.shape
     assert num_streams == 4
 
@@ -542,27 +698,26 @@ def fused_dynamic_weights_forward(
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Fused forward pass for computing dynamic connection weights (Eq. 14-19).
+    Compute dynamic connection weights with fused kernel (Eq. 14-19).
     
-    Optimizations:
-    - Transposed phi layout for coalesced memory access
-    - Sinkhorn-Knopp fused inline (no separate kernel launch)
-    - Single kernel computes all operations
+    This is the main entry point for computing input-dependent mixing weights.
+    All operations (matmul, RMS norm, activations, Sinkhorn) are fused into
+    a single kernel launch for maximum efficiency.
     
     Args:
-        x: Input tensor [batch, in_dim] - mean-pooled flattened hyper-hidden
-        phi: Combined projection matrix [in_dim, n^2 + 2n]
-        bias: Combined bias [n^2 + 2n] (absorbs base params)
-        alpha_pre: Scale for H_pre projection
-        alpha_post: Scale for H_post projection
-        alpha_res: Scale for H_res projection
-        sinkhorn_iters: Iterations for doubly stochastic projection
+        x: Mean-pooled input [batch, n*dim], typically H.mean(dim=1).flatten(-2)
+        phi: Projection matrix [n*dim, 24]
+        bias: Combined bias [24] = [H_pre_base, H_post_base, H_res_base.flatten()]
+        alpha_pre: Learnable scale for H_pre projection
+        alpha_post: Learnable scale for H_post projection
+        alpha_res: Learnable scale for H_res projection
+        sinkhorn_iters: Number of Sinkhorn-Knopp iterations (default 20)
         eps: Numerical stability constant
         
     Returns:
-        H_pre: Pre-mixing weights [batch, n], normalized to sum=1
-        H_post: Post-distribution weights [batch, n], 2*sigmoid
-        H_res: Residual mixing matrix [batch, n, n], doubly stochastic
+        H_pre: Pre-mixing weights [batch, 4], normalized to sum=1
+        H_post: Post-distribution weights [batch, 4], values in (0, 2)
+        H_res: Residual mixing matrix [batch, 4, 4], doubly stochastic
     """
     batch, in_dim = x.shape
     n = 4  # num_streams
@@ -571,7 +726,7 @@ def fused_dynamic_weights_forward(
     assert phi.shape == (in_dim, out_dim), f"phi shape mismatch: {phi.shape} vs ({in_dim}, {out_dim})"
     assert bias.shape == (out_dim,), f"bias shape mismatch: {bias.shape} vs ({out_dim},)"
     
-    # Ensure contiguous and float32
+    # Ensure contiguous and float32 for computation
     x = x.contiguous().float()
     bias = bias.contiguous().float()
     
@@ -583,7 +738,7 @@ def fused_dynamic_weights_forward(
     H_post = torch.empty(batch, n, device=x.device, dtype=torch.float32)
     H_res = torch.empty(batch, n, n, device=x.device, dtype=torch.float32)
     
-    # Launch fully fused kernel (includes Sinkhorn)
+    # Launch fully fused kernel
     grid = (batch,)
     _fused_dynamic_weights_kernel[grid](
         x, phi_t, bias,
