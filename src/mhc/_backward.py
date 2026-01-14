@@ -1,6 +1,19 @@
 """Backward Triton kernels for Manifold-Constrained Hyper-Connections.
 
+This module implements optimized GPU kernels for the mHC backward pass.
+
 Key optimization: Recomputation during backward to avoid storing intermediate states.
+This trades O(T²) compute for O(1) memory in Sinkhorn backward, enabling 20x memory
+reduction compared to storing all intermediate matrices.
+
+Kernel Overview:
+- _sinkhorn_backward_kernel: Backward through Sinkhorn with O(T²) recomputation
+- _add_residual_backward_kernel: Backward through Eq. 12
+- _stream_mix_backward_kernel: Backward through Eq. 10-11
+
+Weight Gradient Reduction:
+The kernels compute partial sums per (batch, seq, dim_block) which are then
+reduced using PyTorch's optimized sum() for parallel reduction.
 """
 
 import torch
@@ -9,10 +22,9 @@ import triton.language as tl
 from typing import Tuple
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Sinkhorn Backward Kernel
-# Recomputes forward pass to save memory (20x reduction)
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 @triton.jit
 def _sinkhorn_backward_kernel(
@@ -22,7 +34,50 @@ def _sinkhorn_backward_kernel(
     eps: tl.constexpr,
     NUM_STREAMS: tl.constexpr,
 ):
-    """Backward through Sinkhorn with O(T²) recomputation."""
+    """
+    Backward through Sinkhorn-Knopp with O(T²) recomputation strategy.
+    
+    Instead of storing T intermediate matrices during forward (O(T) memory),
+    this kernel recomputes the forward pass to each iteration during backward,
+    trading O(T²) compute for O(1) memory. For T=20 iterations, this reduces
+    memory by 20x while only moderately increasing compute.
+    
+    Algorithm:
+        For iter = T-1 down to 0:
+            1. Recompute forward pass from M_orig to state at iteration iter
+            2. Compute one forward step (row norm, then column norm)
+            3. Backward through column normalization: 
+               dx_i = (dy_i - <dy, y>) / col_sum
+            4. Backward through row normalization:
+               dx_i = (dy_i - <dy, y>) / row_sum
+        Finally, multiply by sign for abs() backward
+    
+    Grid: (batch,) - one program per batch element
+    
+    Memory:
+        - M_orig: Original input (read-only)
+        - dP: Upstream gradient (read-only)
+        - dM: Output gradient (write-only)
+        All matrices are 4x4, kept entirely in registers.
+    
+    Complexity:
+        - Time: O(T²) forward recomputation per batch element
+        - Memory: O(1) - only stores current iteration state
+    
+    Args:
+        M_orig_ptr: Original input tensor [batch, 4, 4] before Sinkhorn
+        dP_ptr: Upstream gradient w.r.t. output [batch, 4, 4]
+        dM_ptr: Output gradient w.r.t. input [batch, 4, 4]
+        batch: Batch size
+        num_iters: Number of Sinkhorn iterations (constexpr)
+        eps: Numerical stability constant (constexpr)
+        NUM_STREAMS: Must be 4 (constexpr)
+    
+    Note:
+        The backward through normalization y = x/sum(x) is:
+        dx_i = (dy_i - sum(dy * y)) / sum_x
+        which removes the component of the gradient in the direction of y.
+    """
     pid = tl.program_id(0)
     if pid >= batch:
         return
@@ -47,7 +102,7 @@ def _sinkhorn_backward_kernel(
     m32_orig = tl.load(M_orig_ptr + base + 14).to(tl.float32)
     m33_orig = tl.load(M_orig_ptr + base + 15).to(tl.float32)
 
-    # Sign for abs() backward
+    # Sign for abs() backward: d(abs(x))/dx = sign(x)
     s00 = tl.where(m00_orig >= 0, 1.0, -1.0)
     s01 = tl.where(m01_orig >= 0, 1.0, -1.0)
     s02 = tl.where(m02_orig >= 0, 1.0, -1.0)
@@ -87,7 +142,7 @@ def _sinkhorn_backward_kernel(
     for _iter in range(num_iters):
         target_iter = num_iters - 1 - _iter
 
-        # Recompute forward to target state
+        # Recompute forward pass from M_orig to target_iter state
         m00 = tl.abs(m00_orig) + eps
         m01 = tl.abs(m01_orig) + eps
         m02 = tl.abs(m02_orig) + eps
@@ -105,6 +160,7 @@ def _sinkhorn_backward_kernel(
         m32 = tl.abs(m32_orig) + eps
         m33 = tl.abs(m33_orig) + eps
 
+        # Recompute forward iterations up to (but not including) target_iter
         for _fwd in range(num_iters):
             if _fwd < target_iter:
                 r0 = m00 + m01 + m02 + m03 + eps
@@ -125,12 +181,14 @@ def _sinkhorn_backward_kernel(
                 m02 /= c2; m12 /= c2; m22 /= c2; m32 /= c2
                 m03 /= c3; m13 /= c3; m23 /= c3; m33 /= c3
 
-        # Forward step at target_iter
+        # Now at state before target_iter, compute one forward step
+        # to get intermediate values needed for backward
         r0 = m00 + m01 + m02 + m03 + eps
         r1 = m10 + m11 + m12 + m13 + eps
         r2 = m20 + m21 + m22 + m23 + eps
         r3 = m30 + m31 + m32 + m33 + eps
 
+        # After row normalization
         mr00 = m00 / r0; mr01 = m01 / r0; mr02 = m02 / r0; mr03 = m03 / r0
         mr10 = m10 / r1; mr11 = m11 / r1; mr12 = m12 / r1; mr13 = m13 / r1
         mr20 = m20 / r2; mr21 = m21 / r2; mr22 = m22 / r2; mr23 = m23 / r2
@@ -141,12 +199,15 @@ def _sinkhorn_backward_kernel(
         c2 = mr02 + mr12 + mr22 + mr32 + eps
         c3 = mr03 + mr13 + mr23 + mr33 + eps
 
+        # After column normalization (output of this iteration)
         mc00 = mr00 / c0; mc10 = mr10 / c0; mc20 = mr20 / c0; mc30 = mr30 / c0
         mc01 = mr01 / c1; mc11 = mr11 / c1; mc21 = mr21 / c1; mc31 = mr31 / c1
         mc02 = mr02 / c2; mc12 = mr12 / c2; mc22 = mr22 / c2; mc32 = mr32 / c2
         mc03 = mr03 / c3; mc13 = mr13 / c3; mc23 = mr23 / c3; mc33 = mr33 / c3
 
-        # Backward through column norm: dx_i = (dy_i - <dy, y>) / s
+        # Backward through column normalization: y = x/s where s = sum(x)
+        # dy/dx_i = (1/s) * (1 - y_i) for i != j contribution
+        # Simplified: dx_i = (dy_i - <dy, y>) / s
         dot0 = d00 * mc00 + d10 * mc10 + d20 * mc20 + d30 * mc30
         dot1 = d01 * mc01 + d11 * mc11 + d21 * mc21 + d31 * mc31
         dot2 = d02 * mc02 + d12 * mc12 + d22 * mc22 + d32 * mc32
@@ -161,7 +222,7 @@ def _sinkhorn_backward_kernel(
         dr03 = (d03 - dot3) / c3; dr13 = (d13 - dot3) / c3
         dr23 = (d23 - dot3) / c3; dr33 = (d33 - dot3) / c3
 
-        # Backward through row norm
+        # Backward through row normalization
         dot0 = dr00 * mr00 + dr01 * mr01 + dr02 * mr02 + dr03 * mr03
         dot1 = dr10 * mr10 + dr11 * mr11 + dr12 * mr12 + dr13 * mr13
         dot2 = dr20 * mr20 + dr21 * mr21 + dr22 * mr22 + dr23 * mr23
@@ -176,13 +237,13 @@ def _sinkhorn_backward_kernel(
         d30 = (dr30 - dot3) / r3; d31 = (dr31 - dot3) / r3
         d32 = (dr32 - dot3) / r3; d33 = (dr33 - dot3) / r3
 
-    # Multiply by sign for abs()
+    # Multiply by sign for abs() backward
     d00 *= s00; d01 *= s01; d02 *= s02; d03 *= s03
     d10 *= s10; d11 *= s11; d12 *= s12; d13 *= s13
     d20 *= s20; d21 *= s21; d22 *= s22; d23 *= s23
     d30 *= s30; d31 *= s31; d32 *= s32; d33 *= s33
 
-    # Store
+    # Store output gradient
     tl.store(dM_ptr + base + 0, d00)
     tl.store(dM_ptr + base + 1, d01)
     tl.store(dM_ptr + base + 2, d02)
@@ -201,9 +262,9 @@ def _sinkhorn_backward_kernel(
     tl.store(dM_ptr + base + 15, d33)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Add Residual Backward Kernel
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 @triton.jit
 def _add_residual_backward_kernel(
@@ -214,7 +275,34 @@ def _add_residual_backward_kernel(
     stride_bo_b, stride_bo_s, stride_bo_d,
     BLOCK_DIM: tl.constexpr,
 ):
-    """Backward: H_new = H_residual + H_post * branch_output"""
+    """
+    Backward through residual addition (Eq. 12).
+    
+    Forward: H_new[n] = H_residual[n] + H_post[n] * branch_output
+    
+    Backward:
+        dH_residual = dH_new                      (identity connection)
+        d_branch_output = sum_n(H_post[n] * dH_new[n])
+        dH_post[n] = sum_{s,d}(dH_new[n] * branch_output)
+    
+    Grid: (batch * seq, cdiv(dim, BLOCK_DIM))
+    
+    Weight Gradient Strategy:
+        dH_post requires summing over (seq, dim) axes. We compute partial
+        sums per (batch, seq, dim_block) and store them in dH_post_partial.
+        Final reduction is done in Python using PyTorch's optimized sum().
+    
+    Args:
+        dH_new_ptr: Upstream gradient [batch, seq, 4, dim]
+        branch_output_ptr: Layer output from forward [batch, seq, dim]
+        H_post_ptr: Post-distribution weights [batch, 4]
+        dH_residual_ptr: Output gradient [batch, seq, 4, dim]
+        d_branch_output_ptr: Output gradient [batch, seq, dim]
+        dH_post_partial_ptr: Partial sums [batch, seq, num_d_blocks, 4]
+        batch, seq, dim: Tensor dimensions
+        stride_*: Memory strides
+        BLOCK_DIM: Tile size for dimension axis (constexpr)
+    """
     pid_bs = tl.program_id(0)
     pid_d = tl.program_id(1)
 
@@ -224,7 +312,7 @@ def _add_residual_backward_kernel(
     d_offs = pid_d * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
     d_mask = d_offs < dim
 
-    # Load H_post and branch_output
+    # Load H_post[b,:] and branch_output[b,s,:]
     hp_base = H_post_ptr + b * 4
     hp0 = tl.load(hp_base + 0).to(tl.float32)
     hp1 = tl.load(hp_base + 1).to(tl.float32)
@@ -234,14 +322,14 @@ def _add_residual_backward_kernel(
     bo_base = branch_output_ptr + b * stride_bo_b + s * stride_bo_s
     branch = tl.load(bo_base + d_offs * stride_bo_d, mask=d_mask, other=0.0).to(tl.float32)
 
-    # Load dH_new
+    # Load upstream gradient dH_new[b,s,:,:]
     dh_base = dH_new_ptr + b * stride_h_b + s * stride_h_s
     dh0 = tl.load(dh_base + 0 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     dh1 = tl.load(dh_base + 1 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     dh2 = tl.load(dh_base + 2 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     dh3 = tl.load(dh_base + 3 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
 
-    # dH_residual = dH_new
+    # dH_residual = dH_new (identity backward)
     dhr_base = dH_residual_ptr + b * stride_h_b + s * stride_h_s
     tl.store(dhr_base + 0 * stride_h_n + d_offs * stride_h_d, dh0, mask=d_mask)
     tl.store(dhr_base + 1 * stride_h_n + d_offs * stride_h_d, dh1, mask=d_mask)
@@ -253,7 +341,8 @@ def _add_residual_backward_kernel(
     d_bo_base = d_branch_output_ptr + b * stride_bo_b + s * stride_bo_s
     tl.store(d_bo_base + d_offs * stride_bo_d, d_bo, mask=d_mask)
 
-    # Partial sums for dH_post
+    # Partial sums for dH_post: each block computes sum over its dim chunk
+    # dH_post[n] = sum_{s,d}(dH_new[n,d] * branch_output[d])
     num_d_blocks = tl.cdiv(dim, BLOCK_DIM)
     partial_base = dH_post_partial_ptr + (b * seq + s) * num_d_blocks * 4 + pid_d * 4
     tl.store(partial_base + 0, tl.sum(tl.where(d_mask, dh0 * branch, 0.0)))
@@ -262,32 +351,9 @@ def _add_residual_backward_kernel(
     tl.store(partial_base + 3, tl.sum(tl.where(d_mask, dh3 * branch, 0.0)))
 
 
-@triton.jit
-def _reduce_dH_post_kernel(dH_post_partial_ptr, dH_post_ptr, batch, seq, num_d_blocks):
-    """Reduce partial sums for dH_post."""
-    b = tl.program_id(0)
-    if b >= batch:
-        return
-
-    acc0, acc1, acc2, acc3 = 0.0, 0.0, 0.0, 0.0
-    for s in range(seq):
-        for d_blk in range(num_d_blocks):
-            base = (b * seq + s) * num_d_blocks * 4 + d_blk * 4
-            acc0 += tl.load(dH_post_partial_ptr + base + 0).to(tl.float32)
-            acc1 += tl.load(dH_post_partial_ptr + base + 1).to(tl.float32)
-            acc2 += tl.load(dH_post_partial_ptr + base + 2).to(tl.float32)
-            acc3 += tl.load(dH_post_partial_ptr + base + 3).to(tl.float32)
-
-    out_base = dH_post_ptr + b * 4
-    tl.store(out_base + 0, acc0)
-    tl.store(out_base + 1, acc1)
-    tl.store(out_base + 2, acc2)
-    tl.store(out_base + 3, acc3)
-
-
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Stream Mix Backward Kernel
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 @triton.jit
 def _stream_mix_backward_kernel(
@@ -299,7 +365,38 @@ def _stream_mix_backward_kernel(
     stride_bi_b, stride_bi_s, stride_bi_d,
     BLOCK_DIM: tl.constexpr,
 ):
-    """Backward through stream mixing."""
+    """
+    Backward through stream mixing (Eq. 10-11).
+    
+    Forward:
+        branch_input = sum_n(H_pre[n] * H[n])           (Eq. 10)
+        H_residual[n] = sum_m(H_res[n,m] * H[m])        (Eq. 11)
+    
+    Backward:
+        dH[m] = H_pre[m] * d_branch_input              (from Eq. 10)
+              + sum_n(H_res[n,m] * dH_residual[n])     (from Eq. 11, transposed)
+        dH_pre[n] = sum_{s,d}(d_branch_input * H[n])
+        dH_res[n,m] = sum_{s,d}(dH_residual[n] * H[m])
+    
+    Grid: (batch * seq, cdiv(dim, BLOCK_DIM))
+    
+    Weight Gradient Strategy:
+        dH_pre and dH_res require reduction over (seq, dim). We compute
+        partial sums per (batch, seq, dim_block) and reduce using PyTorch sum().
+    
+    Args:
+        d_branch_input_ptr: Upstream gradient [batch, seq, dim]
+        dH_residual_ptr: Upstream gradient [batch, seq, 4, dim]
+        H_ptr: Input hyper-hidden from forward [batch, seq, 4, dim]
+        H_pre_ptr: Pre-mixing weights [batch, 4]
+        H_res_ptr: Residual mixing matrix [batch, 4, 4]
+        dH_ptr: Output gradient w.r.t. H [batch, seq, 4, dim]
+        dH_pre_partial_ptr: Partial sums [batch, seq, num_d_blocks, 4]
+        dH_res_partial_ptr: Partial sums [batch, seq, num_d_blocks, 16]
+        batch, seq, dim: Tensor dimensions
+        stride_*: Memory strides
+        BLOCK_DIM: Tile size for dimension axis (constexpr)
+    """
     pid_bs = tl.program_id(0)
     pid_d = tl.program_id(1)
 
@@ -309,14 +406,14 @@ def _stream_mix_backward_kernel(
     d_offs = pid_d * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
     d_mask = d_offs < dim
 
-    # Load H[b,s,:,:]
+    # Load H[b,s,:,:] - needed for weight gradients
     h_base = H_ptr + b * stride_h_b + s * stride_h_s
     h0 = tl.load(h_base + 0 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     h1 = tl.load(h_base + 1 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     h2 = tl.load(h_base + 2 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     h3 = tl.load(h_base + 3 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
 
-    # Load weights
+    # Load weights H_pre[b,:] and H_res[b,:,:]
     hp_base = H_pre_ptr + b * 4
     hp0 = tl.load(hp_base + 0).to(tl.float32)
     hp1 = tl.load(hp_base + 1).to(tl.float32)
@@ -341,7 +438,7 @@ def _stream_mix_backward_kernel(
     hr32 = tl.load(hr_base + 14).to(tl.float32)
     hr33 = tl.load(hr_base + 15).to(tl.float32)
 
-    # Load gradients
+    # Load upstream gradients
     dbi_base = d_branch_input_ptr + b * stride_bi_b + s * stride_bi_s
     d_bi = tl.load(dbi_base + d_offs * stride_bi_d, mask=d_mask, other=0.0).to(tl.float32)
 
@@ -351,13 +448,14 @@ def _stream_mix_backward_kernel(
     dhr2 = tl.load(dhr_base + 2 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
     dhr3 = tl.load(dhr_base + 3 * stride_h_n + d_offs * stride_h_d, mask=d_mask, other=0.0).to(tl.float32)
 
-    # dH from branch_input
+    # dH from branch_input: dH[m] += H_pre[m] * d_branch_input
     dh0 = hp0 * d_bi
     dh1 = hp1 * d_bi
     dh2 = hp2 * d_bi
     dh3 = hp3 * d_bi
 
-    # dH from H_residual (transpose of H_res)
+    # dH from H_residual: dH[m] += sum_n(H_res[n,m] * dH_residual[n])
+    # Note: This is H_res^T @ dH_residual (transpose for backward)
     dh0 += hr00 * dhr0 + hr10 * dhr1 + hr20 * dhr2 + hr30 * dhr3
     dh1 += hr01 * dhr0 + hr11 * dhr1 + hr21 * dhr2 + hr31 * dhr3
     dh2 += hr02 * dhr0 + hr12 * dhr1 + hr22 * dhr2 + hr32 * dhr3
@@ -370,7 +468,7 @@ def _stream_mix_backward_kernel(
     tl.store(dh_base + 2 * stride_h_n + d_offs * stride_h_d, dh2, mask=d_mask)
     tl.store(dh_base + 3 * stride_h_n + d_offs * stride_h_d, dh3, mask=d_mask)
 
-    # Partial sums for weight gradients
+    # Partial sums for dH_pre: dH_pre[n] = sum_{s,d}(d_branch_input * H[n])
     num_d_blocks = tl.cdiv(dim, BLOCK_DIM)
     dhp_base = dH_pre_partial_ptr + (b * seq + s) * num_d_blocks * 4 + pid_d * 4
     tl.store(dhp_base + 0, tl.sum(tl.where(d_mask, d_bi * h0, 0.0)))
@@ -378,7 +476,7 @@ def _stream_mix_backward_kernel(
     tl.store(dhp_base + 2, tl.sum(tl.where(d_mask, d_bi * h2, 0.0)))
     tl.store(dhp_base + 3, tl.sum(tl.where(d_mask, d_bi * h3, 0.0)))
 
-    # dH_res partials
+    # Partial sums for dH_res: dH_res[n,m] = sum_{s,d}(dH_residual[n] * H[m])
     dhr_out = dH_res_partial_ptr + (b * seq + s) * num_d_blocks * 16 + pid_d * 16
     tl.store(dhr_out + 0, tl.sum(tl.where(d_mask, dhr0 * h0, 0.0)))
     tl.store(dhr_out + 1, tl.sum(tl.where(d_mask, dhr0 * h1, 0.0)))
@@ -398,87 +496,28 @@ def _stream_mix_backward_kernel(
     tl.store(dhr_out + 15, tl.sum(tl.where(d_mask, dhr3 * h3, 0.0)))
 
 
-@triton.jit
-def _reduce_stream_mix_weights_kernel(
-    dH_pre_partial_ptr, dH_res_partial_ptr, dH_pre_ptr, dH_res_ptr,
-    batch, seq, num_d_blocks,
-):
-    """Reduce partial sums for stream mix weight gradients."""
-    b = tl.program_id(0)
-    if b >= batch:
-        return
-
-    # Accumulators for H_pre (4 values)
-    acc_pre0, acc_pre1, acc_pre2, acc_pre3 = 0.0, 0.0, 0.0, 0.0
-
-    # Accumulators for H_res (16 values, 4x4 matrix)
-    acc_r00, acc_r01, acc_r02, acc_r03 = 0.0, 0.0, 0.0, 0.0
-    acc_r10, acc_r11, acc_r12, acc_r13 = 0.0, 0.0, 0.0, 0.0
-    acc_r20, acc_r21, acc_r22, acc_r23 = 0.0, 0.0, 0.0, 0.0
-    acc_r30, acc_r31, acc_r32, acc_r33 = 0.0, 0.0, 0.0, 0.0
-
-    for s in range(seq):
-        for d_blk in range(num_d_blocks):
-            pre_base = (b * seq + s) * num_d_blocks * 4 + d_blk * 4
-            acc_pre0 += tl.load(dH_pre_partial_ptr + pre_base + 0).to(tl.float32)
-            acc_pre1 += tl.load(dH_pre_partial_ptr + pre_base + 1).to(tl.float32)
-            acc_pre2 += tl.load(dH_pre_partial_ptr + pre_base + 2).to(tl.float32)
-            acc_pre3 += tl.load(dH_pre_partial_ptr + pre_base + 3).to(tl.float32)
-
-            res_base = (b * seq + s) * num_d_blocks * 16 + d_blk * 16
-            acc_r00 += tl.load(dH_res_partial_ptr + res_base + 0).to(tl.float32)
-            acc_r01 += tl.load(dH_res_partial_ptr + res_base + 1).to(tl.float32)
-            acc_r02 += tl.load(dH_res_partial_ptr + res_base + 2).to(tl.float32)
-            acc_r03 += tl.load(dH_res_partial_ptr + res_base + 3).to(tl.float32)
-            acc_r10 += tl.load(dH_res_partial_ptr + res_base + 4).to(tl.float32)
-            acc_r11 += tl.load(dH_res_partial_ptr + res_base + 5).to(tl.float32)
-            acc_r12 += tl.load(dH_res_partial_ptr + res_base + 6).to(tl.float32)
-            acc_r13 += tl.load(dH_res_partial_ptr + res_base + 7).to(tl.float32)
-            acc_r20 += tl.load(dH_res_partial_ptr + res_base + 8).to(tl.float32)
-            acc_r21 += tl.load(dH_res_partial_ptr + res_base + 9).to(tl.float32)
-            acc_r22 += tl.load(dH_res_partial_ptr + res_base + 10).to(tl.float32)
-            acc_r23 += tl.load(dH_res_partial_ptr + res_base + 11).to(tl.float32)
-            acc_r30 += tl.load(dH_res_partial_ptr + res_base + 12).to(tl.float32)
-            acc_r31 += tl.load(dH_res_partial_ptr + res_base + 13).to(tl.float32)
-            acc_r32 += tl.load(dH_res_partial_ptr + res_base + 14).to(tl.float32)
-            acc_r33 += tl.load(dH_res_partial_ptr + res_base + 15).to(tl.float32)
-
-    # Store dH_pre
-    pre_out = dH_pre_ptr + b * 4
-    tl.store(pre_out + 0, acc_pre0)
-    tl.store(pre_out + 1, acc_pre1)
-    tl.store(pre_out + 2, acc_pre2)
-    tl.store(pre_out + 3, acc_pre3)
-
-    # Store dH_res
-    res_out = dH_res_ptr + b * 16
-    tl.store(res_out + 0, acc_r00)
-    tl.store(res_out + 1, acc_r01)
-    tl.store(res_out + 2, acc_r02)
-    tl.store(res_out + 3, acc_r03)
-    tl.store(res_out + 4, acc_r10)
-    tl.store(res_out + 5, acc_r11)
-    tl.store(res_out + 6, acc_r12)
-    tl.store(res_out + 7, acc_r13)
-    tl.store(res_out + 8, acc_r20)
-    tl.store(res_out + 9, acc_r21)
-    tl.store(res_out + 10, acc_r22)
-    tl.store(res_out + 11, acc_r23)
-    tl.store(res_out + 12, acc_r30)
-    tl.store(res_out + 13, acc_r31)
-    tl.store(res_out + 14, acc_r32)
-    tl.store(res_out + 15, acc_r33)
-
-
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Python Wrappers
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 def sinkhorn_backward(
     M_orig: torch.Tensor, dP: torch.Tensor,
     num_iters: int = 20, eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Backward through Sinkhorn-Knopp with recomputation."""
+    """
+    Backward through Sinkhorn-Knopp projection.
+    
+    Uses O(T²) recomputation strategy to achieve O(1) memory usage.
+    
+    Args:
+        M_orig: Original input before Sinkhorn [batch, 4, 4]
+        dP: Upstream gradient w.r.t. Sinkhorn output [batch, 4, 4]
+        num_iters: Number of Sinkhorn iterations used in forward
+        eps: Numerical stability constant
+        
+    Returns:
+        Gradient w.r.t. input [batch, 4, 4]
+    """
     M_orig = M_orig.contiguous()
     dP = dP.contiguous()
     batch = M_orig.shape[0]
@@ -495,7 +534,20 @@ def add_residual_backward(
     dH_new: torch.Tensor, branch_output: torch.Tensor, H_post: torch.Tensor,
     block_dim: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backward through residual addition."""
+    """
+    Backward through residual addition (Eq. 12).
+    
+    Args:
+        dH_new: Upstream gradient [batch, seq, 4, dim]
+        branch_output: Layer output from forward [batch, seq, dim]
+        H_post: Post-distribution weights [batch, 4]
+        block_dim: Tile size for dimension axis
+        
+    Returns:
+        dH_residual: Gradient w.r.t. H_residual [batch, seq, 4, dim]
+        d_branch_output: Gradient w.r.t. branch_output [batch, seq, dim]
+        dH_post: Gradient w.r.t. H_post [batch, 4]
+    """
     batch, seq, num_streams, dim = dH_new.shape
 
     dH_new = dH_new.contiguous()
@@ -517,8 +569,8 @@ def add_residual_backward(
         BLOCK_DIM=block_dim,
     )
 
-    dH_post = torch.empty(batch, 4, device=dH_new.device, dtype=dH_new.dtype)
-    _reduce_dH_post_kernel[(batch,)](dH_post_partial, dH_post, batch, seq, num_d_blocks)
+    # Use PyTorch's optimized parallel reduction for weight gradients
+    dH_post = dH_post_partial.sum(dim=(1, 2)).to(dH_new.dtype)
 
     return dH_residual, d_branch_output, dH_post
 
@@ -528,7 +580,22 @@ def stream_mix_backward(
     H: torch.Tensor, H_pre: torch.Tensor, H_res: torch.Tensor,
     block_dim: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backward through stream mixing."""
+    """
+    Backward through stream mixing (Eq. 10-11).
+    
+    Args:
+        d_branch_input: Upstream gradient [batch, seq, dim]
+        dH_residual: Upstream gradient [batch, seq, 4, dim]
+        H: Input hyper-hidden from forward [batch, seq, 4, dim]
+        H_pre: Pre-mixing weights [batch, 4]
+        H_res: Residual mixing matrix [batch, 4, 4]
+        block_dim: Tile size for dimension axis
+        
+    Returns:
+        dH: Gradient w.r.t. H [batch, seq, 4, dim]
+        dH_pre: Gradient w.r.t. H_pre [batch, 4]
+        dH_res: Gradient w.r.t. H_res [batch, 4, 4]
+    """
     batch, seq, num_streams, dim = H.shape
 
     d_branch_input = d_branch_input.contiguous()
@@ -552,12 +619,8 @@ def stream_mix_backward(
         BLOCK_DIM=block_dim,
     )
 
-    dH_pre = torch.empty(batch, 4, device=H.device, dtype=H.dtype)
-    dH_res = torch.empty(batch, 4, 4, device=H.device, dtype=H.dtype)
-    _reduce_stream_mix_weights_kernel[(batch,)](
-        dH_pre_partial, dH_res_partial, dH_pre, dH_res,
-        batch, seq, num_d_blocks,
-    )
+    # Use PyTorch's optimized parallel reduction for weight gradients
+    dH_pre = dH_pre_partial.sum(dim=(1, 2)).to(H.dtype)
+    dH_res = dH_res_partial.sum(dim=(1, 2)).reshape(batch, 4, 4).to(H.dtype)
 
     return dH, dH_pre, dH_res
-

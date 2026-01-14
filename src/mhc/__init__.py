@@ -8,11 +8,17 @@ Reference: https://arxiv.org/html/2512.24880
 """
 
 from .module import HyperConnection
-from .ops import sinkhorn_knopp, fused_stream_mix, fused_add_residual
+from .ops import (
+    sinkhorn_knopp,
+    fused_stream_mix,
+    fused_add_residual,
+    fused_dynamic_weights,
+)
 from ._torch_baseline import (
     sinkhorn_knopp_torch,
     fused_stream_mix_torch,
     fused_add_residual_torch,
+    fused_dynamic_weights_torch,
     HyperConnectionTorch,
 )
 
@@ -22,10 +28,11 @@ __all__ = [
     "sinkhorn_knopp",
     "fused_stream_mix",
     "fused_add_residual",
+    "fused_dynamic_weights",
     # PyTorch baselines for benchmarking
     "sinkhorn_knopp_torch",
     "fused_stream_mix_torch",
     "fused_add_residual_torch",
+    "fused_dynamic_weights_torch",
     "HyperConnectionTorch",
 ]
-

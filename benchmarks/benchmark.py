@@ -4,7 +4,6 @@
 Usage:
     python benchmarks/benchmark.py
 
-This will output a markdown table suitable for pasting into README.md
 """
 
 import torch
@@ -16,9 +15,11 @@ from mhc import (
     sinkhorn_knopp,
     fused_stream_mix,
     fused_add_residual,
+    fused_dynamic_weights,
     sinkhorn_knopp_torch,
     fused_stream_mix_torch,
     fused_add_residual_torch,
+    fused_dynamic_weights_torch,
     HyperConnection,
     HyperConnectionTorch,
 )
@@ -101,6 +102,40 @@ def benchmark_add_residual(
         (H_residual, branch_output, H_post),
     )
 
+    return torch_time, triton_time
+
+
+def benchmark_dynamic_weights(
+    batch: int, dim: int, device: str = "cuda"
+) -> Tuple[float, float]:
+    """Benchmark dynamic weight computation."""
+    n = 4
+    in_dim = n * dim  # nC
+    out_dim = n * n + 2 * n  # 24
+    
+    x = torch.randn(batch, in_dim, device=device, dtype=torch.float32)
+    phi = torch.randn(in_dim, out_dim, device=device, dtype=torch.float32) * 0.01
+    bias = torch.randn(out_dim, device=device, dtype=torch.float32)
+    alpha_pre = torch.tensor(0.1, device=device, dtype=torch.float32)
+    alpha_post = torch.tensor(0.1, device=device, dtype=torch.float32)
+    alpha_res = torch.tensor(0.1, device=device, dtype=torch.float32)
+    
+    # PyTorch baseline
+    torch_time = benchmark_fn(
+        lambda: fused_dynamic_weights_torch(
+            x, phi, bias, alpha_pre, alpha_post, alpha_res
+        ),
+        (),
+    )
+    
+    # Triton (fused with inline Sinkhorn)
+    triton_time = benchmark_fn(
+        lambda: fused_dynamic_weights(
+            x, phi, bias, alpha_pre, alpha_post, alpha_res
+        ),
+        (),
+    )
+    
     return torch_time, triton_time
 
 
@@ -231,16 +266,11 @@ def benchmark_simple_residual(
     batch: int, seq: int, dim: int, device: str = "cuda"
 ) -> float:
     """Benchmark simple residual connection forward+backward."""
-    # Simple residual: x_out = x + layer(x)
-    # Use same total tensor size as HyperConnection (batch, seq, 4, dim) flattened
-    # to (batch, seq, 4*dim) for a fair comparison of data movement
     x = torch.randn(batch, seq, 4 * dim, device=device, dtype=torch.float16, requires_grad=True)
 
     def forward_backward_simple():
         x_in = x.detach().requires_grad_(True)
-        # Simulate a simple layer (same as in HyperConnection benchmark)
         layer_output = x_in * 0.5
-        # Simple residual addition
         x_out = x_in + layer_output
         loss = x_out.sum()
         loss.backward()
@@ -285,7 +315,6 @@ def main():
     results = []
 
     # Sinkhorn benchmark
-    # Use batch * seq for Sinkhorn to match the scale of operations
     sinkhorn_batch = args.batch * args.seq
     torch_time, triton_time = benchmark_sinkhorn(sinkhorn_batch, num_iters=20)
     speedup = torch_time / triton_time
@@ -303,6 +332,12 @@ def main():
     speedup = torch_time / triton_time
     results.append(("Add Residual", torch_time, triton_time, speedup))
     print(f"Add Residual:            PyTorch {torch_time:.2f}ms | Triton {triton_time:.2f}ms | Speedup {speedup:.1f}x")
+
+    # Dynamic Weights benchmark (Eq. 14-19)
+    torch_time, triton_time = benchmark_dynamic_weights(args.batch, args.dim)
+    speedup = torch_time / triton_time
+    results.append(("Dynamic Weights", torch_time, triton_time, speedup))
+    print(f"Dynamic Weights:         PyTorch {torch_time:.4f}ms | Triton {triton_time:.4f}ms | Speedup {speedup:.1f}x")
 
     # Full Forward+Backward benchmark
     torch_time, triton_time = benchmark_full_forward_backward(args.batch, args.seq, args.dim)
@@ -337,7 +372,7 @@ def main():
     simple_time = benchmark_simple_residual(args.batch, args.seq, args.dim)
     simple_mem = benchmark_simple_residual_memory(args.batch, args.seq, args.dim)
 
-    # Get HyperConnection Triton numbers (already computed)
+    # Get HyperConnection Triton numbers
     hc_time = results[-1][2]  # Triton time from Full Forward+Backward
     hc_mem = memory_results[-1][2]  # Triton memory from Full Forward+Backward
 
@@ -378,4 +413,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
