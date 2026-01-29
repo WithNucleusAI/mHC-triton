@@ -1,6 +1,6 @@
 # mHC-Triton
 
-**Manifold-Constrained Hyper-Connections** with fused Triton kernels for efficient training.
+**Manifold-Constrained Hyper-Connections** with fused Triton kernels for efficient training. Refer [blog](https://dev.withnucleus.ai/blog/mhc-triton)
 
 Created by [NucleusAI](https://github.com/WithNucleusAI)
 
