@@ -202,14 +202,6 @@ Benchmarks on NVIDIA H100 80GB HBM3 (batch=16, seq=2048, dim=4096):
 | Sinkhorn Backward | 120.0MB | 68.0MB | 1.8x |
 | Full Forward+Backward | 8003.6MB | 6162.8MB | 1.3x |
 
-### vs Simple Residual
-
-| Method | Time | Memory |
-|--------|------|--------|
-| Simple Residual | 4.01ms | 5184.0MB |
-| HyperConnection (Triton) | 13.66ms | 6162.8MB |
-| **Overhead** | **3.4x** | **1.2x** |
-
 ## Requirements
 
 - Python ≥ 3.9

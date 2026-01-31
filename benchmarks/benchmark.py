@@ -262,40 +262,6 @@ def benchmark_full_memory(
     return torch_mem, triton_mem
 
 
-def benchmark_simple_residual(
-    batch: int, seq: int, dim: int, device: str = "cuda"
-) -> float:
-    """Benchmark simple residual connection forward+backward."""
-    x = torch.randn(batch, seq, 4 * dim, device=device, dtype=torch.float16, requires_grad=True)
-
-    def forward_backward_simple():
-        x_in = x.detach().requires_grad_(True)
-        layer_output = x_in * 0.5
-        x_out = x_in + layer_output
-        loss = x_out.sum()
-        loss.backward()
-        return x_in.grad
-
-    return benchmark_fn(forward_backward_simple, ())
-
-
-def benchmark_simple_residual_memory(
-    batch: int, seq: int, dim: int, device: str = "cuda"
-) -> float:
-    """Benchmark memory usage for simple residual connection."""
-    x = torch.randn(batch, seq, 4 * dim, device=device, dtype=torch.float16, requires_grad=True)
-
-    def forward_backward_simple():
-        x_in = x.detach().requires_grad_(True)
-        layer_output = x_in * 0.5
-        x_out = x_in + layer_output
-        loss = x_out.sum()
-        loss.backward()
-        return x_in.grad
-
-    return measure_peak_memory(forward_backward_simple)
-
-
 def main():
     parser = argparse.ArgumentParser(description="Benchmark mHC-Triton kernels")
     parser.add_argument("--batch", type=int, default=8, help="Batch size")
@@ -364,25 +330,6 @@ def main():
     memory_results.append(("Full Forward+Backward", torch_mem, triton_mem, savings))
     print(f"Full Forward+Backward:   PyTorch {torch_mem:.1f}MB | Triton {triton_mem:.1f}MB | Savings {savings:.1f}x")
 
-    # Comparison with simple residual
-    print(f"\n{'-'*60}")
-    print("Comparison vs Simple Residual Connection:")
-    print(f"{'-'*60}")
-
-    simple_time = benchmark_simple_residual(args.batch, args.seq, args.dim)
-    simple_mem = benchmark_simple_residual_memory(args.batch, args.seq, args.dim)
-
-    # Get HyperConnection Triton numbers
-    hc_time = results[-1][2]  # Triton time from Full Forward+Backward
-    hc_mem = memory_results[-1][2]  # Triton memory from Full Forward+Backward
-
-    time_overhead = hc_time / simple_time
-    mem_overhead = hc_mem / simple_mem
-
-    print(f"Simple Residual:          {simple_time:.2f}ms | {simple_mem:.1f}MB")
-    print(f"HyperConnection (Triton): {hc_time:.2f}ms | {hc_mem:.1f}MB")
-    print(f"Overhead:                 {time_overhead:.1f}x slower | {mem_overhead:.1f}x more memory")
-
     # Print markdown table
     print(f"\n{'='*60}")
     print("Markdown tables for README.md:")
@@ -400,13 +347,6 @@ def main():
     print("|-----------|---------|--------|---------|")
     for name, pt_mem, tr_mem, savings in memory_results:
         print(f"| {name} | {pt_mem:.1f}MB | {tr_mem:.1f}MB | {savings:.1f}x |")
-
-    print("\n### vs Simple Residual\n")
-    print("| Method | Time | Memory |")
-    print("|--------|------|--------|")
-    print(f"| Simple Residual | {simple_time:.2f}ms | {simple_mem:.1f}MB |")
-    print(f"| HyperConnection (Triton) | {hc_time:.2f}ms | {hc_mem:.1f}MB |")
-    print(f"| **Overhead** | **{time_overhead:.1f}x** | **{mem_overhead:.1f}x** |")
 
     print()
 
