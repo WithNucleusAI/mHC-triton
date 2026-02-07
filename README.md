@@ -8,9 +8,8 @@ Based on the paper: [Hyper-Connections](https://arxiv.org/html/2512.24880) by th
 
 ## Features
 
-- **Fused Triton kernels** implementing paper's Section 4.3 optimizations
-- **6.2x faster** full forward+backward vs PyTorch baseline
-- **3.4x overhead** vs simple residual 
+- **Fused Triton kernels** implemented DeepSeek's optimizations
+- **6.2x faster** full forward+backward vs PyTorch baseline 
 - **Full autograd support** for training
 
 ## Installation
